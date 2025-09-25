@@ -1,0 +1,9 @@
+__pycache__/
+*.egg-info/
+*.ipynb_checkpoints/
+data/
+checkpoints/
+outputs/
+.env
+cd /mnt/c/Users/lucas/workspace/myproj
+docker build -t myproj:25.08 .
