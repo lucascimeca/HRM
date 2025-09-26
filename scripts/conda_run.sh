@@ -1,4 +1,5 @@
 #!/bin/bash -l
+#SBATCH --job-name=hrm_ddp
 #SBATCH --constraint="80gb"
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=6
