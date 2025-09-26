@@ -7,12 +7,12 @@ cat > run_ddp.sbatch << 'EOF'
 #SBATCH --time=12:00:00
 #SBATCH -o %x-%j.out
 
-module load apptainer
-SIF=$SCRATCH/images/pytorch_25.08.sif
+module load singularity
+SIF=$SCRATCH/images/hrm_nvidia.25.08.sif
 CODE=$HOME/projects/HRM
 DATA=$SCRATCH/data
 
-srun apptainer exec --nv -B ${CODE}:/workspace,${DATA}:/data ${SIF} \
+srun singularity exec --nv -B ${CODE}:/workspace,${DATA}:/data ${SIF} \
      bash -lc 'cd /workspace && \
        torchrun --nproc_per_node=$SLURM_GPUS_PER_NODE ../pretrain.py \
          --data_path data/sudoku-extreme-1k-aug-1000  \
