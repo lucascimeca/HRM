@@ -2,7 +2,7 @@
 #SBATCH --job-name=hrm_ddp
 #SBATCH --partition=main
 #SBATCH --nodes=1
-#SBATCH --constraint="30gb|48gb|80gb"
+#SBATCH --constraint="40gb|48gb|80gb"
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
