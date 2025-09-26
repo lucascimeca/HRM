@@ -51,6 +51,6 @@ srun singularity exec --nv \
        set -euo pipefail
        cd /workspace
        echo 'Launching torchrun with --nproc_per_node=${GPUS_PER_NODE}'
-       torchrun --nproc_per_node=${GPUS_PER_NODE} pretrain.py --data /data
+       torchrun --nproc_per_node=${GPUS_PER_NODE} pretrain.py data_path=data/sudoku-extreme-1k-aug-1000 epochs=20000 eval_interval=2000 global_batch_size=384 lr=7e-5 puzzle_emb_lr=7e-5 weight_decay=1.0 puzzle_emb_weight_decay=1.0
      "
 
