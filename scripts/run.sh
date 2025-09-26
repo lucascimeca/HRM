@@ -1,4 +1,3 @@
-cat > run_ddp.sbatch << 'EOF'
 #!/bin/bash
 #SBATCH --job-name=hrm_ddp
 #SBATCH --gres=gpu:4
