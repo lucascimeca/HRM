@@ -57,12 +57,12 @@ fi
 echo "GPUS_PER_NODE=${GPUS_PER_NODE}"
 
 # now assign positional args
-DATASET="$1"
-FREQ_SLOPE="$2"
-EXP_NAME="$3"
-SEED="$4"
-
-echo "[DEBUG] 1=$1, 2=$2, 3=$3, 4=$4" >&2
+#DATASET="$1"
+#FREQ_SLOPE="$2"
+#EXP_NAME="$3"
+#SEED="$4"
+#
+#echo "[DEBUG] 1=$1, 2=$2, 3=$3, 4=$4" >&2
 
 
 # inside your job, before launching torchrun
