@@ -48,13 +48,69 @@ srun singularity exec --nv --writable-tmpfs \
      "$SIF" \
      bash -lc '
        set -euo pipefail
-       # --- libcuda: make sure Triton finds it ---
-       export LD_LIBRARY_PATH=/usr/local/cuda/compat/lib:${LD_LIBRARY_PATH}
-       ln -sf /usr/local/cuda/compat/lib/libcuda.so.1 /usr/local/cuda/compat/lib/libcuda.so
 
-       # (optional) quieter compile/autotune + W&B dir
+       # --- 1) Find libcuda.so.1 provided by --nv ---
+       # Common locations that Singularity binds on different clusters
+       CANDIDATES=(
+         /usr/local/cuda/compat/lib
+         /usr/local/nvidia/lib64
+         /usr/lib/x86_64-linux-gnu
+         /lib/x86_64-linux-gnu
+         /usr/lib64
+         /usr/lib
+       )
+       CUDA_DIR=""
+       for d in "${CANDIDATES[@]}"; do
+         if [ -e "$d/libcuda.so.1" ]; then
+           CUDA_DIR="$d"
+           break
+         fi
+       done
+
+       if [ -z "${CUDA_DIR}" ]; then
+         echo "ERROR: Could not locate libcuda.so.1 in known paths" >&2
+         echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH-}" >&2
+         # Last resort: disable Inductor/Triton to let training proceed
+         export TORCHDYNAMO_DISABLE=1
+       else
+         echo "Found libcuda.so.1 at: ${CUDA_DIR}"
+
+         # --- 2) Make sure libcuda.so exists where Triton looks ---
+         # Try to place the symlink next to libcuda.so.1; if not writable, use a private shim dir.
+         if ln -sf "${CUDA_DIR}/libcuda.so.1" "${CUDA_DIR}/libcuda.so" 2>/dev/null; then
+           export LD_LIBRARY_PATH="${CUDA_DIR}:${LD_LIBRARY_PATH-}"
+           echo "Created ${CUDA_DIR}/libcuda.so and added ${CUDA_DIR} to LD_LIBRARY_PATH"
+         else
+           echo "WARN: ${CUDA_DIR} not writable; creating a private shim" >&2
+           mkdir -p /opt/libcuda_shim
+           # Prefer a symlink to keep it lightweight
+           ln -sf "${CUDA_DIR}/libcuda.so.1" /opt/libcuda_shim/libcuda.so || {
+             # As a fallback, copy the file if symlink fails
+             cp -f "${CUDA_DIR}/libcuda.so.1" /opt/libcuda_shim/libcuda.so
+           }
+           export LD_LIBRARY_PATH="/opt/libcuda_shim:${CUDA_DIR}:${LD_LIBRARY_PATH-}"
+           echo "Using /opt/libcuda_shim and added it to LD_LIBRARY_PATH"
+         fi
+       fi
+
+       # (optional) tone down inductor autotune warnings + set W&B dir
        export TORCHINDUCTOR_MAX_AUTOTUNE_GEMM=0
        export WANDB_DIR=/workspace/wandb
+
+       # --- 3) Sanity check before launching torchrun ---
+       python - << "PY"
+import os, ctypes, glob, sys
+print("CUDA_VISIBLE_DEVICES=", os.environ.get("CUDA_VISIBLE_DEVICES"))
+print("LD_LIBRARY_PATH=", os.environ.get("LD_LIBRARY_PATH"))
+print("libcuda candidates:", [p for p in glob.glob("/**/libcuda.so*", recursive=True)[:10]])
+try:
+    ctypes.CDLL("libcuda.so")
+    print("CDLL(libcuda.so) OK")
+except OSError as e:
+    print("CDLL(libcuda.so) FAILED:", e)
+    # Fail early if Inductor will inevitably crash
+    sys.exit(2)
+PY
 
        cd /workspace
        echo "Launching torchrun (GPUs per node = ${GPUS_PER_NODE})"
@@ -63,5 +119,6 @@ srun singularity exec --nv --writable-tmpfs \
          epochs=20000 eval_interval=2000 global_batch_size=384 \
          lr=7e-5 puzzle_emb_lr=7e-5 weight_decay=1.0 puzzle_emb_weight_decay=1.0
      '
+
 
 
