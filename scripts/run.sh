@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=hrm_ddp
-#SBATCH --gres=gpu:4
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH -o %x-%j.out
 
