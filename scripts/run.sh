@@ -51,6 +51,6 @@ srun singularity exec --nv \
        set -euo pipefail
        cd /workspace
        echo 'Launching torchrun with --nproc_per_node=${GPUS_PER_NODE}'
-       torchrun --nproc_per_node=${GPUS_PER_NODE} train.py --data /data
+       torchrun --nproc_per_node=${GPUS_PER_NODE} pretrain.py --data /data
      "
 
