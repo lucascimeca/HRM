@@ -15,7 +15,7 @@ set -euo pipefail
 module load singularity/3.7.1
 
 # 2) paths (EDIT these to your actual paths)
-SIF="$SCRATCH/images/pytorch_25.08.sif"    # your .sif image
+SIF="$SCRATCH/images/hrm_nvidia.25.08.sif"    # your .sif image
 CODE="$HOME/projects/HRM"                  # your repo directory on the cluster
 DATA="$SCRATCH/data"                       # datasets/checkpoints/output directory
 
