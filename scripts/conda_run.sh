@@ -83,7 +83,7 @@ export LD_LIBRARY_PATH="$PWD/libcuda_shim:/usr/lib/x86_64-linux-gnu:/lib/x86_64-
 
 
 torchrun --nproc_per_node=${GPUS_PER_NODE} ../pretrain.py \
-    data_path=data/sudoku-extreme-1k-aug-1000 \
+    data_path=$SCRATCH/projects/HRM/data/sudoku-extreme-1k-aug-1000 \
     epochs=20000 \
     eval_interval=2000 \
     global_batch_size=384 \
