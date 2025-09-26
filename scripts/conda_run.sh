@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -l
 #SBATCH --constraint="80gb"
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=6
@@ -63,6 +63,22 @@ EXP_NAME="$3"
 SEED="$4"
 
 echo "[DEBUG] 1=$1, 2=$2, 3=$3, 4=$4" >&2
+
+
+# inside your job, before launching torchrun
+mkdir -p "$PWD/libcuda_shim"
+
+# prefer a real, existing .so.1
+if [ -f /usr/local/cuda/compat/lib/libcuda.so.1 ]; then
+  ln -sf /usr/local/cuda/compat/lib/libcuda.so.1 "$PWD/libcuda_shim/libcuda.so.1"
+  ln -sf /usr/local/cuda/compat/lib/libcuda.so.1 "$PWD/libcuda_shim/libcuda.so"
+elif [ -f /lib/x86_64-linux-gnu/libcuda.so.1 ]; then
+  ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 "$PWD/libcuda_shim/libcuda.so.1"
+  ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 "$PWD/libcuda_shim/libcuda.so"
+fi
+
+export LD_LIBRARY_PATH="$PWD/libcuda_shim:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+
 
 torchrun --nproc_per_node=${GPUS_PER_NODE} pretrain.py \
     data_path=data/sudoku-extreme-1k-aug-1000 \
