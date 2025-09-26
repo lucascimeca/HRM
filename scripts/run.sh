@@ -43,68 +43,45 @@ fi
 echo "GPUS_PER_NODE=${GPUS_PER_NODE}"
 export SINGULARITYENV_GPUS_PER_NODE="${GPUS_PER_NODE}"
 
-srun singularity exec --nv --writable-tmpfs \
+srun singularity exec --nv \
   -B "${CODE}:/workspace","${DATA}:/data" \
   "$SIF" \
   bash -lc '
     set -euo pipefail
 
-    # --- Make sure Triton can dlopen("libcuda.so") ---
-    # Common locations on Singularity 3.7 with --nv
-    CANDIDATES=(
-      "/.singularity.d/libs"
-      "/usr/local/cuda/compat/lib"
-      "/usr/local/nvidia/lib64"
-      "/usr/lib/x86_64-linux-gnu"
-      "/lib/x86_64-linux-gnu"
-      "/usr/lib64"
-      "/usr/lib"
-    )
-
+    # 1) Locate the driver .so that --nv provides
+    CANDIDATES=( "/.singularity.d/libs" "/usr/local/cuda/compat/lib" "/usr/local/nvidia/lib64" )
     CUDA_DIR=""
     for d in "${CANDIDATES[@]}"; do
       if [ -r "$d/libcuda.so.1" ]; then CUDA_DIR="$d"; break; fi
     done
-
     echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-}"
     echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH-}"
     echo "libcuda search hit: ${CUDA_DIR:-<none>}"
 
+    # 2) Create a shim in a writable place (your bind mount)
     if [ -z "${CUDA_DIR}" ]; then
-      echo "ERROR: libcuda.so.1 not found in expected dirs. Listing /.singularity.d/libs:" >&2
-      ls -l /.singularity.d/libs || true
-      # Let training proceed without Inductor (no Triton)
+      echo "ERROR: libcuda.so.1 not found; disabling Inductor to proceed." >&2
       export TORCHDYNAMO_DISABLE=1
     else
-      # Put libcuda.so right next to libcuda.so.1 (dir should be writable under --writable-tmpfs)
-      if ln -sf "${CUDA_DIR}/libcuda.so.1" "${CUDA_DIR}/libcuda.so" 2>/dev/null; then
-        echo "Created ${CUDA_DIR}/libcuda.so -> libcuda.so.1"
-      else
-        echo "WARN: ${CUDA_DIR} not writable; falling back to private shim" >&2
-        mkdir -p /opt/libcuda_shim
-        ln -sf "${CUDA_DIR}/libcuda.so.1" /opt/libcuda_shim/libcuda.so || cp -f "${CUDA_DIR}/libcuda.so.1" /opt/libcuda_shim/libcuda.so
-        export LD_LIBRARY_PATH="/opt/libcuda_shim:${LD_LIBRARY_PATH-}"
-      fi
-      # Ensure the chosen dir is searched first
-      export LD_LIBRARY_PATH="${CUDA_DIR}:${LD_LIBRARY_PATH-}"
+      SHIM_DIR="/workspace/.libcuda_shim"
+      mkdir -p "$SHIM_DIR"
+      ln -sf "${CUDA_DIR}/libcuda.so.1" "${SHIM_DIR}/libcuda.so"
+      export LD_LIBRARY_PATH="${SHIM_DIR}:${CUDA_DIR}:${LD_LIBRARY_PATH-}"
+      echo "Shim at ${SHIM_DIR}/libcuda.so -> ${CUDA_DIR}/libcuda.so.1"
     fi
 
-    # Optional: quiet warnings + set W&B dir
+    # Optional: quieter warnings + set W&B dir
     export TORCHINDUCTOR_MAX_AUTOTUNE_GEMM=0
     export WANDB_DIR=/workspace/wandb
 
-    # Quick, cheap sanity (no recursive globbing)
+    # 3) Quick sanity
     python - << "PY"
-import os, ctypes, sys
-print("cuda.is_available pre-run? (may be False until NCCL init is done)")
-try:
-    ctypes.CDLL("libcuda.so")
-    print("CDLL(libcuda.so) OK")
-except OSError as e:
-    print("CDLL(libcuda.so) FAILED:", e)
-    # If Inductor would crash later, bail now
-    # Comment the next line if you prefer to continue anyway
-    # sys.exit(2)
+import ctypes, os
+print("CUDA_VISIBLE_DEVICES =", os.environ.get("CUDA_VISIBLE_DEVICES"))
+print("LD_LIBRARY_PATH =", os.environ.get("LD_LIBRARY_PATH"))
+ctypes.CDLL("libcuda.so")
+print("CDLL(libcuda.so) OK")
 PY
 
     cd /workspace
