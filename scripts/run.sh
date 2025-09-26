@@ -42,6 +42,22 @@ fi
 
 echo "GPUS_PER_NODE=${GPUS_PER_NODE}"
 
+
+# inside your job, before launching torchrun
+mkdir -p "$PWD/libcuda_shim"
+
+# prefer a real, existing .so.1
+if [ -f /usr/local/cuda/compat/lib/libcuda.so.1 ]; then
+  ln -sf /usr/local/cuda/compat/lib/libcuda.so.1 "$PWD/libcuda_shim/libcuda.so.1"
+  ln -sf /usr/local/cuda/compat/lib/libcuda.so.1 "$PWD/libcuda_shim/libcuda.so"
+elif [ -f /lib/x86_64-linux-gnu/libcuda.so.1 ]; then
+  ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 "$PWD/libcuda_shim/libcuda.so.1"
+  ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 "$PWD/libcuda_shim/libcuda.so"
+fi
+
+export LD_LIBRARY_PATH="$PWD/libcuda_shim:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+
+
 # 5) run inside the container with GPU support (--nv) and bind mounts (-B)
 #    Use srun so Slurm tracks the task.
 srun singularity exec --nv \
