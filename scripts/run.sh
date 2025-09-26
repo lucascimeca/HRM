@@ -2,7 +2,7 @@
 #SBATCH --job-name=hrm_ddp
 #SBATCH --partition=main
 #SBATCH --nodes=1
-#SBATCH --constraint="40gb|48gb|80gb"
+#SBATCH --constraint="80gb"
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
@@ -41,57 +41,16 @@ if ! [[ "$GPUS_PER_NODE" =~ ^[0-9]+$ ]] || [[ "$GPUS_PER_NODE" -lt 1 ]]; then
 fi
 
 echo "GPUS_PER_NODE=${GPUS_PER_NODE}"
-export SINGULARITYENV_GPUS_PER_NODE="${GPUS_PER_NODE}"
 
+# 5) run inside the container with GPU support (--nv) and bind mounts (-B)
+#    Use srun so Slurm tracks the task.
 srun singularity exec --nv \
-  -B "${CODE}:/workspace","${DATA}:/data" \
-  "$SIF" \
-  bash -lc '
-    set -euo pipefail
-
-    # 1) Locate the driver .so that --nv provides
-    CANDIDATES=( "/.singularity.d/libs" "/usr/local/cuda/compat/lib" "/usr/local/nvidia/lib64" )
-    CUDA_DIR=""
-    for d in "${CANDIDATES[@]}"; do
-      if [ -r "$d/libcuda.so.1" ]; then CUDA_DIR="$d"; break; fi
-    done
-    echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-}"
-    echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH-}"
-    echo "libcuda search hit: ${CUDA_DIR:-<none>}"
-
-    # 2) Create a shim in a writable place (your bind mount)
-    if [ -z "${CUDA_DIR}" ]; then
-      echo "ERROR: libcuda.so.1 not found; disabling Inductor to proceed." >&2
-      export TORCHDYNAMO_DISABLE=1
-    else
-      SHIM_DIR="/workspace/.libcuda_shim"
-      mkdir -p "$SHIM_DIR"
-      ln -sf "${CUDA_DIR}/libcuda.so.1" "${SHIM_DIR}/libcuda.so"
-      export LD_LIBRARY_PATH="${SHIM_DIR}:${CUDA_DIR}:${LD_LIBRARY_PATH-}"
-      echo "Shim at ${SHIM_DIR}/libcuda.so -> ${CUDA_DIR}/libcuda.so.1"
-    fi
-
-    # Optional: quieter warnings + set W&B dir
-    export TORCHINDUCTOR_MAX_AUTOTUNE_GEMM=0
-    export WANDB_DIR=/workspace/wandb
-
-    # 3) Quick sanity
-    python - << "PY"
-import ctypes, os
-print("CUDA_VISIBLE_DEVICES =", os.environ.get("CUDA_VISIBLE_DEVICES"))
-print("LD_LIBRARY_PATH =", os.environ.get("LD_LIBRARY_PATH"))
-ctypes.CDLL("libcuda.so")
-print("CDLL(libcuda.so) OK")
-PY
-
-    cd /workspace
-    echo "Launching torchrun (GPUs per node = ${GPUS_PER_NODE})"
-    torchrun --nproc_per_node=${GPUS_PER_NODE} pretrain.py \
-      data_path=data/sudoku-extreme-1k-aug-1000 \
-      epochs=20000 eval_interval=2000 global_batch_size=384 \
-      lr=7e-5 puzzle_emb_lr=7e-5 weight_decay=1.0 puzzle_emb_weight_decay=1.0
-  '
-
-
-
+     -B "${CODE}:/workspace","${DATA}:/data" \
+     "$SIF" \
+     bash -lc "
+       set -euo pipefail
+       cd /workspace
+       echo 'Launching torchrun with --nproc_per_node=${GPUS_PER_NODE}'
+       torchrun --nproc_per_node=${GPUS_PER_NODE} pretrain.py data_path=data/sudoku-extreme-1k-aug-1000 epochs=20000 eval_interval=2000 global_batch_size=384 lr=7e-5 puzzle_emb_lr=7e-5 weight_decay=1.0 puzzle_emb_weight_decay=1.0
+     "
 
