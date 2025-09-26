@@ -43,15 +43,16 @@ fi
 echo "GPUS_PER_NODE=${GPUS_PER_NODE}"
 export SINGULARITYENV_GPUS_PER_NODE="${GPUS_PER_NODE}"
 
-srun singularity exec --nv \
+srun singularity exec --nv --writable-tmpfs \
      -B "${CODE}:/workspace","${DATA}:/data" \
      "$SIF" \
      bash -lc '
        set -euo pipefail
+       # --- libcuda: make sure Triton finds it ---
        export LD_LIBRARY_PATH=/usr/local/cuda/compat/lib:${LD_LIBRARY_PATH}
-       mkdir -p /tmp/libcuda_shim
-       ln -sf /usr/local/cuda/compat/lib/libcuda.so.1 /tmp/libcuda_shim/libcuda.so
-       export LD_LIBRARY_PATH=/tmp/libcuda_shim:${LD_LIBRARY_PATH}
+       ln -sf /usr/local/cuda/compat/lib/libcuda.so.1 /usr/local/cuda/compat/lib/libcuda.so
+
+       # (optional) quieter compile/autotune + W&B dir
        export TORCHINDUCTOR_MAX_AUTOTUNE_GEMM=0
        export WANDB_DIR=/workspace/wandb
 
@@ -61,5 +62,6 @@ srun singularity exec --nv \
          data_path=data/sudoku-extreme-1k-aug-1000 \
          epochs=20000 eval_interval=2000 global_batch_size=384 \
          lr=7e-5 puzzle_emb_lr=7e-5 weight_decay=1.0 puzzle_emb_weight_decay=1.0
-         '
+     '
+
 
