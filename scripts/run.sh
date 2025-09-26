@@ -47,10 +47,24 @@ echo "GPUS_PER_NODE=${GPUS_PER_NODE}"
 srun singularity exec --nv \
      -B "${CODE}:/workspace","${DATA}:/data" \
      "$SIF" \
-     bash -lc "
+     bash -lc '
        set -euo pipefail
+       # --- make libcuda.so visible to Triton/Inductor ---
+       export LD_LIBRARY_PATH=/usr/local/cuda/compat/lib:${LD_LIBRARY_PATH}
+       mkdir -p /tmp/libcuda_shim
+       ln -sf /usr/local/cuda/compat/lib/libcuda.so.1 /tmp/libcuda_shim/libcuda.so
+       export LD_LIBRARY_PATH=/tmp/libcuda_shim:${LD_LIBRARY_PATH}
+       # (optional) tone down inductor autotune warnings
+       export TORCHINDUCTOR_MAX_AUTOTUNE_GEMM=0
+       # (optional) fix your W&B dir path (you had /workspace/wandb/wandb earlier)
+       export WANDB_DIR=/workspace/wandb
+
        cd /workspace
-       echo 'Launching torchrun with --nproc_per_node=${GPUS_PER_NODE}'
-       torchrun --nproc_per_node=${GPUS_PER_NODE} pretrain.py data_path=data/sudoku-extreme-1k-aug-1000 epochs=20000 eval_interval=2000 global_batch_size=384 lr=7e-5 puzzle_emb_lr=7e-5 weight_decay=1.0 puzzle_emb_weight_decay=1.0
-     "
+       echo "Launching torchrun (GPUs per node = ${GPUS_PER_NODE})"
+       torchrun --nproc_per_node=${GPUS_PER_NODE} pretrain.py \
+         data_path=data/sudoku-extreme-1k-aug-1000 \
+         epochs=20000 eval_interval=2000 global_batch_size=384 \
+         lr=7e-5 puzzle_emb_lr=7e-5 weight_decay=1.0 puzzle_emb_weight_decay=1.0
+     '
+
 
