@@ -106,11 +106,9 @@ class RotaryEmbedding(nn.Module):
     def forward(self):
         return self.cos_cached, self.sin_cached
 
-
 class Attention(nn.Module):
     def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False):
         super().__init__()
-
         self.hidden_size = hidden_size
         self.head_dim = head_dim
         self.output_size = head_dim * num_heads
@@ -121,44 +119,27 @@ class Attention(nn.Module):
         self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
 
-    def _standard_attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    def _sdpa_attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         """
-        A standard, pure-PyTorch implementation of scaled dot-product attention.
-        This serves as a fallback when FlashAttention is not available.
+        Fallback to PyTorch's optimized scaled_dot_product_attention.
         """
-        # GQA: Repeat K and V heads to match Q heads
-        if self.num_heads != self.num_key_value_heads:
-            repeats = self.num_heads // self.num_key_value_heads
-            key = key.repeat_interleave(repeats, dim=2)
-            value = value.repeat_interleave(repeats, dim=2)
-
-        # Reshape for batched matrix multiplication
-        # [batch_size, seq_len, num_heads, head_dim] -> [batch_size, num_heads, seq_len, head_dim]
+        # SDPA expects the heads dimension before the sequence length dimension
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
-        # Calculate attention scores
-        scale = self.head_dim ** -0.5
-        attn_scores = (query @ key.transpose(-2, -1)) * scale
+        # Let PyTorch handle the heavy lifting
+        attn_output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            is_causal=self.causal
+        )
 
-        # Apply causal mask if required
-        if self.causal:
-            seq_len = query.size(2)
-            mask = torch.triu(torch.ones(seq_len, seq_len, device=query.device, dtype=torch.bool), diagonal=1)
-            attn_scores = attn_scores.masked_fill(mask, float('-inf'))
+        # Transpose back to the original format
+        return attn_output.transpose(1, 2).contiguous()
 
-        # Softmax and apply to values
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_output = attn_weights @ value
-
-        # Reshape back to the original format
-        # [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, num_heads, head_dim]
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        return attn_output
-
-
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
         qkv = self.qkv_proj(hidden_states)
@@ -169,20 +150,13 @@ class Attention(nn.Module):
         key = qkv[:, :, self.num_heads: self.num_heads + self.num_key_value_heads]
         value = qkv[:, :, self.num_heads + self.num_key_value_heads:]
 
-        # RoPE
-        if cos_sin is not None:
-            cos, sin = cos_sin
-            query, key = apply_rotary_pos_emb(query, key, cos, sin)
-
-        # === CONDITIONAL ATTENTION ===
+        # --- CONDITIONAL ATTENTION LOGIC ---
         if _flash_attn_available:
-            # Use FlashAttention
+            # Use FlashAttention for maximum speed
             attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal)
-            if isinstance(attn_output, tuple):  # Compatibility for different flash_attn versions
-                attn_output = attn_output[0]
         else:
-            # Use fallback standard attention
-            attn_output = self._standard_attention(query, key, value)
+            # Use the optimized PyTorch 2.0 fallback
+            attn_output = self._sdpa_attention(query, key, value)
 
         attn_output = attn_output.view(batch_size, seq_len, self.output_size)
         return self.o_proj(attn_output)
