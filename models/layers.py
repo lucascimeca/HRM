@@ -4,11 +4,23 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+# Attempt to import flash_attn and set a flag
 try:
-    from flash_attn_interface import flash_attn_func  # type: ignore[import]
+    # Try FlashAttention v2
+    from flash_attn import flash_attn_func
+    _flash_attn_available = True
+    print("FlashAttention-2 detected! ⚡️")
 except ImportError:
-    # Fallback to FlashAttention 2
-    from flash_attn import flash_attn_func  # type: ignore[import]
+    try:
+        # Fallback to legacy FlashAttention v1
+        from flash_attn_interface import flash_attn_func
+        _flash_attn_available = True
+        print("Legacy FlashAttention-1 detected! ⚡️")
+    except ImportError:
+        # If both fail, set the flag to False
+        _flash_attn_available = False
+        flash_attn_func = None # Define the name to avoid NameError
+        print("FlashAttention not found. Using standard PyTorch attention. 🐌")
 
 from models.common import trunc_normal_init_
 
@@ -109,13 +121,49 @@ class Attention(nn.Module):
         self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
 
+    def _standard_attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        """
+        A standard, pure-PyTorch implementation of scaled dot-product attention.
+        This serves as a fallback when FlashAttention is not available.
+        """
+        # GQA: Repeat K and V heads to match Q heads
+        if self.num_heads != self.num_key_value_heads:
+            repeats = self.num_heads // self.num_key_value_heads
+            key = key.repeat_interleave(repeats, dim=2)
+            value = value.repeat_interleave(repeats, dim=2)
+
+        # Reshape for batched matrix multiplication
+        # [batch_size, seq_len, num_heads, head_dim] -> [batch_size, num_heads, seq_len, head_dim]
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+
+        # Calculate attention scores
+        scale = self.head_dim ** -0.5
+        attn_scores = (query @ key.transpose(-2, -1)) * scale
+
+        # Apply causal mask if required
+        if self.causal:
+            seq_len = query.size(2)
+            mask = torch.triu(torch.ones(seq_len, seq_len, device=query.device, dtype=torch.bool), diagonal=1)
+            attn_scores = attn_scores.masked_fill(mask, float('-inf'))
+
+        # Softmax and apply to values
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_output = attn_weights @ value
+
+        # Reshape back to the original format
+        # [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, num_heads, head_dim]
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output
+
+
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
-        # hidden_states: [bs, seq_len, num_heads, head_dim]
         qkv = self.qkv_proj(hidden_states)
 
-        # Split head
+        # Split heads
         qkv = qkv.view(batch_size, seq_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
         query = qkv[:, :, :self.num_heads]
         key = qkv[:, :, self.num_heads: self.num_heads + self.num_key_value_heads]
@@ -126,12 +174,17 @@ class Attention(nn.Module):
             cos, sin = cos_sin
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # flash attn
-        attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal)
-        if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
-            attn_output = attn_output[0]
+        # === CONDITIONAL ATTENTION ===
+        if _flash_attn_available:
+            # Use FlashAttention
+            attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal)
+            if isinstance(attn_output, tuple):  # Compatibility for different flash_attn versions
+                attn_output = attn_output[0]
+        else:
+            # Use fallback standard attention
+            attn_output = self._standard_attention(query, key, value)
 
-        attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
+        attn_output = attn_output.view(batch_size, seq_len, self.output_size)
         return self.o_proj(attn_output)
 
 
