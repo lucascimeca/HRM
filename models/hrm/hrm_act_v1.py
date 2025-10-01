@@ -476,23 +476,38 @@ class RoutedExperts(nn.Module):
 
         # Flatten for easier processing
         hidden_states_flat = hidden_states.view(-1, hidden_size)  # [B*S, H]
-        expert_indices_flat = expert_indices.view(batch_size * seq_len, self.num_experts_per_tok)
-        expert_weights_flat = expert_weights.view(batch_size * seq_len, self.num_experts_per_tok)
+        expert_indices_flat = expert_indices.view(-1, self.num_experts_per_tok)  # [B*S, K]
+        expert_weights_flat = expert_weights.view(-1, self.num_experts_per_tok)  # [B*S, K]
 
         # Initialize output
-        output = torch.zeros_like(hidden_states_flat)
+        output = torch.zeros_like(hidden_states_flat)  # [B*S, H]
 
-        # Process each token with its selected experts
-        for token_idx in range(batch_size * seq_len):
-            token_input = hidden_states_flat[token_idx:token_idx + 1]  # [1, H]
+        # VECTORIZED APPROACH: Process all tokens for each expert
+        # This avoids .item() calls and is much faster
+        for expert_idx in range(self.num_experts):
+            # Find which tokens route to this expert
+            expert_mask = (expert_indices_flat == expert_idx)  # [B*S, K]
 
-            for k in range(self.num_experts_per_tok):
-                expert_idx = expert_indices_flat[token_idx, k].item()
-                weight = expert_weights_flat[token_idx, k]
+            # Get the positions where this expert is used
+            token_indices, k_indices = torch.where(expert_mask)
 
-                # Apply expert and accumulate weighted output
-                expert_output = self.experts[expert_idx](token_input)
-                output[token_idx] += weight * expert_output.squeeze(0)
+            if len(token_indices) == 0:
+                continue  # No tokens route to this expert
+
+            # Get inputs for all tokens that use this expert
+            expert_inputs = hidden_states_flat[token_indices]  # [num_routed, H]
+
+            # Get weights for these routings
+            expert_weights_batch = expert_weights_flat[token_indices, k_indices]  # [num_routed]
+
+            # Apply expert once for all routed tokens
+            expert_outputs = self.experts[expert_idx](expert_inputs)  # [num_routed, H]
+
+            # Weight the outputs
+            weighted_outputs = expert_outputs * expert_weights_batch.unsqueeze(-1)  # [num_routed, H]
+
+            # Scatter add to output (handles multiple experts per token)
+            output.index_add_(0, token_indices, weighted_outputs)
 
         output = output.view(batch_size, seq_len, hidden_size)
 
