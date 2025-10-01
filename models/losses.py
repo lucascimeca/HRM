@@ -54,7 +54,7 @@ class ACTLossHead(nn.Module):
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
         # Model logits
         # B x SeqLen x D
-        new_carry, outputs = self.model(**model_kwargs)
+        new_carry, outputs, aux_loss = self.model(**model_kwargs)
         labels = new_carry.current_data["labels"]
 
         # Correctness
@@ -86,6 +86,7 @@ class ACTLossHead(nn.Module):
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
+            "aux_loss": aux_loss.detach() if aux_loss is not None else torch.tensor(0.0, device=lm_loss.device),
         })
 
         # Q continue (bootstrapping target loss)
@@ -98,4 +99,4 @@ class ACTLossHead(nn.Module):
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), aux_loss, metrics, detached_outputs, new_carry.halted.all()

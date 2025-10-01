@@ -132,8 +132,8 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     with torch.device("cuda"):
         model: nn.Module = model_cls(model_cfg)
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
-        if "DISABLE_COMPILE" not in os.environ:
-            model = torch.compile(model, dynamic=False)  # type: ignore
+        # if "DISABLE_COMPILE" not in os.environ:
+        #     model = torch.compile(model, dynamic=False)  # type: ignore
 
         # Broadcast parameters from rank 0
         if world_size > 1:
@@ -228,9 +228,9 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
-    train_state.carry, loss, metrics, _, _, aux_loss = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    train_state.carry, loss, aux_loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
 
-    ((1 / global_batch_size) * loss).backward()
+    ((1 / global_batch_size) * (loss + aux_loss)).backward()
 
     # Allreduce
     if world_size > 1:

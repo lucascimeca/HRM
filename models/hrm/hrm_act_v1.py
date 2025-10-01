@@ -140,7 +140,7 @@ class HierarchicalReasoningModel_ACTV1Block(nn.Module):
         else:
             # DeepSeekMoE with post-norm
             moe_output, aux_losses = self.moe(hidden_states)
-            hidden_states = self.rms_norm(moe_output)
+            hidden_states = rms_norm(hidden_states + moe_output, variance_epsilon=self.norm_eps)
 
         return hidden_states, aux_losses
 
@@ -242,7 +242,7 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: HierarchicalReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    def forward(self, carry: HierarchicalReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1InnerCarry, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -275,7 +275,7 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         # Q head
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
         
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), aux_loss
+        return new_carry, output, aux_loss, (q_logits[..., 0], q_logits[..., 1])
 
 
 class HierarchicalReasoningModel_ACTV1(nn.Module):
@@ -311,7 +311,7 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits), aux_loss = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, aux_loss, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
             "logits": logits,
@@ -391,6 +391,11 @@ class RoutedExperts(nn.Module):
         # Router: expert centroids for computing affinity scores
         self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
 
+        # Ensure router dtype matches model dtype
+        # Will be overridden by model.to(dtype) if called later
+        if hasattr(config, 'dtype'):
+            self.router = self.router.to(dtype=config.dtype)
+
         # Device assignment: which experts belong to which device
         experts_per_device = self.num_experts // self.num_devices
         self.expert_to_device = torch.arange(self.num_experts) // experts_per_device
@@ -409,37 +414,73 @@ class RoutedExperts(nn.Module):
         """
         batch_size, seq_len, hidden_size = hidden_states.shape
 
+        # Ensure dtype consistency - cast router weights to match input
+        router_dtype = next(self.router.parameters()).dtype
+        if hidden_states.dtype != router_dtype:
+            # Cast hidden_states to match router, or vice versa
+            # Typically you want to cast to the lower precision
+            if hidden_states.dtype == torch.bfloat16 or hidden_states.dtype == torch.float16:
+                self.router = self.router.to(dtype=hidden_states.dtype)
+
         # Compute affinity scores: s_i,t = Softmax(u_t^T * e_i)
         router_logits = self.router(hidden_states)  # [B, S, num_experts]
         routing_scores = F.softmax(router_logits, dim=-1)
 
         if self.max_devices_per_token < self.num_devices:
-            # Device-limited routing
-            # Step 1: Select M devices with highest cumulative expert scores
+            # Device-limited routing (VECTORIZED)
+            # Step 1: Aggregate scores per device
+            # Create a mapping tensor: [num_experts] -> device_id
+            expert_to_device = self.expert_to_device.to(hidden_states.device)
+
+            # Reshape routing_scores for easier device aggregation
+            # [B, S, num_experts] -> [B, S, num_devices, experts_per_device]
+            experts_per_device = self.num_experts // self.num_devices
+
+            # Aggregate scores per device using scatter_add
             device_scores = torch.zeros(
                 batch_size, seq_len, self.num_devices,
-                device=hidden_states.device
+                device=hidden_states.device,
+                dtype=routing_scores.dtype
             )
 
-            # Aggregate scores per device
-            for device_id in range(self.num_devices):
-                device_mask = (self.expert_to_device == device_id).to(hidden_states.device)
-                device_scores[:, :, device_id] = (routing_scores * device_mask).sum(dim=-1)
+            # Expand expert_to_device for broadcasting
+            # [num_experts] -> [B, S, num_experts]
+            device_indices = expert_to_device.unsqueeze(0).unsqueeze(0).expand(
+                batch_size, seq_len, -1
+            )
 
-            # Select top M devices
+            # Sum scores for each device
+            device_scores.scatter_add_(
+                dim=2,
+                index=device_indices,
+                src=routing_scores
+            )
+
+            # Step 2: Select top M devices per token
             _, selected_devices = torch.topk(
                 device_scores,
                 k=self.max_devices_per_token,
                 dim=-1
             )  # [B, S, M]
 
-            # Create mask for experts on selected devices
-            device_mask = torch.zeros_like(routing_scores, dtype=torch.bool)
-            for token_idx in range(seq_len):
-                for batch_idx in range(batch_size):
-                    for device_id in selected_devices[batch_idx, token_idx]:
-                        expert_mask = (self.expert_to_device == device_id).to(hidden_states.device)
-                        device_mask[batch_idx, token_idx] = device_mask[batch_idx, token_idx] | expert_mask
+            # Step 3: Create expert mask (VECTORIZED - no loops!)
+            # For each expert, check if its device is in the selected devices
+            # [B, S, num_experts] where True means expert's device is selected
+
+            # Get device for each expert: [num_experts]
+            expert_devices = expert_to_device  # [num_experts]
+
+            # Expand for broadcasting: [1, 1, num_experts]
+            expert_devices_expanded = expert_devices.unsqueeze(0).unsqueeze(0)
+
+            # Expand selected_devices for comparison: [B, S, M, 1]
+            selected_devices_expanded = selected_devices.unsqueeze(-1)
+
+            # Check if each expert's device is in selected devices
+            # [B, S, 1, num_experts] == [B, S, M, 1] -> [B, S, M, num_experts]
+            # Then reduce over M dimension with any()
+            device_mask = (expert_devices_expanded == selected_devices_expanded).any(dim=2)
+            # Result: [B, S, num_experts] - True if expert's device was selected
 
             # Mask out experts not on selected devices
             masked_scores = routing_scores.masked_fill(~device_mask, float('-inf'))
@@ -589,7 +630,10 @@ class DeepSeekMoE(nn.Module):
         """
         Forward pass combining shared and routed experts.
 
-        h'_t = u_t + Σ FFN_shared(u_t) + Σ g_i,t * FFN_routed(u_t)
+        Returns the MoE transformation WITHOUT residual connection.
+        The residual is handled by the Block layer for consistency with standard FFN.
+
+        output = Σ FFN_shared(u_t) + Σ g_i,t * FFN_routed(u_t)
         """
         # Shared experts (always activated)
         shared_output = self.shared_experts(hidden_states)
@@ -597,8 +641,8 @@ class DeepSeekMoE(nn.Module):
         # Routed experts (sparse activation)
         routed_output, aux_losses = self.routed_experts(hidden_states)
 
-        # Combine with residual
-        output = hidden_states + shared_output + routed_output
+        # Combine WITHOUT residual (Block layer handles residual + norm)
+        output = shared_output + routed_output
 
         return output, aux_losses
 
