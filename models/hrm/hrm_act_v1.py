@@ -57,8 +57,57 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
     forward_dtype: str = "bfloat16"
 
 
+class MoEConfig(BaseModel):
+    batch_size: int
+    seq_len: int
+    num_puzzle_identifiers: int
+    vocab_size: int
+
+    H_cycles: int
+    L_cycles: int
+
+    H_layers: int
+    L_layers: int
+
+    # Transformer config
+    hidden_size: int
+    expansion: float
+    num_heads: int
+    pos_encodings: str
+
+    puzzle_emb_ndim: int = 0
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 10000.0
+
+    # Halting Q-learning config
+    halt_max_steps: int
+    halt_exploration_prob: float
+
+    forward_dtype: str = "bfloat16"
+
+    """Configuration for DeepSeekMoE"""
+    hidden_size: int
+    num_shared_experts: int = 2
+    num_routed_experts: int = 160
+    num_experts_per_tok: int = 6  # K_r in the paper
+    expert_intermediate_size: int = 1536
+    num_devices: int = 8
+    max_devices_per_token: int = 3  # M in the paper
+
+    # Balance loss coefficients
+    expert_balance_factor: float = 0.003  # α1
+    device_balance_factor: float = 0.05  # α2
+    comm_balance_factor: float = 0.02  # α3
+
+    # Other configs from your existing Block
+    num_heads: int = 32
+    # rms_norm_eps: float = 1e-6
+    use_token_dropping: bool = True
+    capacity_factor: float = 1.0
+
+
 class HierarchicalReasoningModel_ACTV1Block(nn.Module):
-    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
+    def __init__(self, config: MoEConfig, moe:bool=False) -> None:
         super().__init__()
 
         self.self_attn = Attention(
@@ -72,15 +121,28 @@ class HierarchicalReasoningModel_ACTV1Block(nn.Module):
             hidden_size=config.hidden_size,
             expansion=config.expansion,
         )
+
+        self.moe = None
+        if moe:
+            self.moe = DeepSeekMoE(config)
+
         self.norm_eps = config.rms_norm_eps
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Post Norm
         # Self Attention
         hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
-        # Fully Connected
-        hidden_states = rms_norm(hidden_states + self.mlp(hidden_states), variance_epsilon=self.norm_eps)
-        return hidden_states
+
+        if self.moe is None:
+            # Fully Connected
+            hidden_states = rms_norm(hidden_states + self.mlp(hidden_states), variance_epsilon=self.norm_eps)
+            aux_losses = None
+        else:
+            # DeepSeekMoE with post-norm
+            moe_output, aux_losses = self.moe(hidden_states)
+            hidden_states = self.rms_norm(moe_output)
+
+        return hidden_states, aux_losses
 
 
 class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
@@ -89,18 +151,21 @@ class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
 
         self.layers = torch.nn.ModuleList(layers)
 
-    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Input injection (add)
         hidden_states = hidden_states + input_injection
-        # Layers
-        for layer in self.layers:
-            hidden_states = layer(hidden_states=hidden_states, **kwargs)
 
-        return hidden_states
+        # Layers
+        aux_loss_agg = 0
+        for layer in self.layers:
+            hidden_state, aux_losses = layer(hidden_states=hidden_states, **kwargs)
+            if aux_losses is not None: aux_loss_agg += aux_losses['total_aux_loss']
+
+        return hidden_states, aux_loss_agg
 
 
 class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
-    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
+    def __init__(self, config: MoEConfig) -> None:
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
@@ -130,7 +195,7 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             raise NotImplementedError()
 
         # Reasoning Layers
-        self.H_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.H_layers)])
+        self.H_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config, moe=_i > 0) for _i in range(self.config.H_layers)])  # add moe layers
         self.L_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
         
         # Initial states
@@ -177,7 +242,7 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: HierarchicalReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, carry: HierarchicalReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -192,16 +257,16 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             for _H_step in range(self.config.H_cycles):
                 for _L_step in range(self.config.L_cycles):
                     if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
-                        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                        z_L, _ = self.L_level(z_L, z_H + input_embeddings, **seq_info)
 
                 if not (_H_step == self.config.H_cycles - 1):
-                    z_H = self.H_level(z_H, z_L, **seq_info)
+                    z_H, _ = self.H_level(z_H, z_L, **seq_info)
 
         assert not z_H.requires_grad and not z_L.requires_grad
 
         # 1-step grad
-        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.H_level(z_H, z_L, **seq_info)
+        z_L, _ = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+        z_H, aux_loss = self.H_level(z_H, z_L, **seq_info)
 
         # LM Outputs
         new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
@@ -210,7 +275,7 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         # Q head
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
         
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), aux_loss
 
 
 class HierarchicalReasoningModel_ACTV1(nn.Module):
@@ -218,7 +283,7 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
 
     def __init__(self, config_dict: dict):
         super().__init__()
-        self.config = HierarchicalReasoningModel_ACTV1Config(**config_dict)
+        self.config = MoEConfig(**config_dict)
         self.inner = HierarchicalReasoningModel_ACTV1_Inner(self.config)
 
     @property
@@ -237,7 +302,7 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
         
-    def forward(self, carry: HierarchicalReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
+    def forward(self, carry: HierarchicalReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1Carry, Dict[str, torch.Tensor], torch.Tensor]:
         # Update data, carry (removing halted sequences)
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
         
@@ -246,7 +311,7 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), aux_loss = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
             "logits": logits,
@@ -280,4 +345,290 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
                 
                 outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-        return HierarchicalReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+        return HierarchicalReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs, aux_loss
+
+
+
+
+# ------------------------------------------------------
+
+
+class SharedExperts(nn.Module):
+    """Shared experts that are always activated"""
+
+    def __init__(self, config: MoEConfig):
+        super().__init__()
+        self.experts = nn.ModuleList([
+            SwiGLU(config.hidden_size, config.expansion)
+            for _ in range(config.num_shared_experts)
+        ])
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Sum outputs from all shared experts
+        output = torch.zeros_like(hidden_states)
+        for expert in self.experts:
+            output = output + expert(hidden_states)
+        return output
+
+
+class RoutedExperts(nn.Module):
+    """Routed experts with top-K selection"""
+
+    def __init__(self, config: MoEConfig):
+        super().__init__()
+        self.config = config
+        self.num_experts = config.num_routed_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.max_devices_per_token = config.max_devices_per_token
+        self.num_devices = config.num_devices
+
+        # Create expert modules
+        self.experts = nn.ModuleList([
+            SwiGLU(config.hidden_size, config.expansion)
+            for _ in range(self.num_experts)
+        ])
+
+        # Router: expert centroids for computing affinity scores
+        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+
+        # Device assignment: which experts belong to which device
+        experts_per_device = self.num_experts // self.num_devices
+        self.expert_to_device = torch.arange(self.num_experts) // experts_per_device
+
+    def compute_routing_scores(
+            self,
+            hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute routing scores with device-limited routing.
+
+        Returns:
+            expert_indices: [batch_size, seq_len, num_experts_per_tok]
+            expert_weights: [batch_size, seq_len, num_experts_per_tok]
+            router_logits: [batch_size, seq_len, num_experts]
+        """
+        batch_size, seq_len, hidden_size = hidden_states.shape
+
+        # Compute affinity scores: s_i,t = Softmax(u_t^T * e_i)
+        router_logits = self.router(hidden_states)  # [B, S, num_experts]
+        routing_scores = F.softmax(router_logits, dim=-1)
+
+        if self.max_devices_per_token < self.num_devices:
+            # Device-limited routing
+            # Step 1: Select M devices with highest cumulative expert scores
+            device_scores = torch.zeros(
+                batch_size, seq_len, self.num_devices,
+                device=hidden_states.device
+            )
+
+            # Aggregate scores per device
+            for device_id in range(self.num_devices):
+                device_mask = (self.expert_to_device == device_id).to(hidden_states.device)
+                device_scores[:, :, device_id] = (routing_scores * device_mask).sum(dim=-1)
+
+            # Select top M devices
+            _, selected_devices = torch.topk(
+                device_scores,
+                k=self.max_devices_per_token,
+                dim=-1
+            )  # [B, S, M]
+
+            # Create mask for experts on selected devices
+            device_mask = torch.zeros_like(routing_scores, dtype=torch.bool)
+            for token_idx in range(seq_len):
+                for batch_idx in range(batch_size):
+                    for device_id in selected_devices[batch_idx, token_idx]:
+                        expert_mask = (self.expert_to_device == device_id).to(hidden_states.device)
+                        device_mask[batch_idx, token_idx] = device_mask[batch_idx, token_idx] | expert_mask
+
+            # Mask out experts not on selected devices
+            masked_scores = routing_scores.masked_fill(~device_mask, float('-inf'))
+        else:
+            masked_scores = routing_scores
+
+        # Step 2: Select top-K experts from allowed experts
+        expert_weights, expert_indices = torch.topk(
+            masked_scores,
+            k=self.num_experts_per_tok,
+            dim=-1
+        )  # [B, S, K]
+
+        # Renormalize weights
+        expert_weights = F.softmax(expert_weights, dim=-1)
+
+        return expert_indices, expert_weights, router_logits
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Forward pass with top-K routing.
+
+        Returns:
+            output: [batch_size, seq_len, hidden_size]
+            aux_loss_dict: Dictionary containing auxiliary losses
+        """
+        batch_size, seq_len, hidden_size = hidden_states.shape
+
+        # Get routing decisions
+        expert_indices, expert_weights, router_logits = self.compute_routing_scores(hidden_states)
+
+        # Flatten for easier processing
+        hidden_states_flat = hidden_states.view(-1, hidden_size)  # [B*S, H]
+        expert_indices_flat = expert_indices.view(batch_size * seq_len, self.num_experts_per_tok)
+        expert_weights_flat = expert_weights.view(batch_size * seq_len, self.num_experts_per_tok)
+
+        # Initialize output
+        output = torch.zeros_like(hidden_states_flat)
+
+        # Process each token with its selected experts
+        for token_idx in range(batch_size * seq_len):
+            token_input = hidden_states_flat[token_idx:token_idx + 1]  # [1, H]
+
+            for k in range(self.num_experts_per_tok):
+                expert_idx = expert_indices_flat[token_idx, k].item()
+                weight = expert_weights_flat[token_idx, k]
+
+                # Apply expert and accumulate weighted output
+                expert_output = self.experts[expert_idx](token_input)
+                output[token_idx] += weight * expert_output.squeeze(0)
+
+        output = output.view(batch_size, seq_len, hidden_size)
+
+        # Compute auxiliary losses for load balancing
+        aux_losses = self._compute_auxiliary_losses(
+            router_logits,
+            expert_indices,
+            expert_weights
+        )
+
+        return output, aux_losses
+
+    def _compute_auxiliary_losses(
+            self,
+            router_logits: torch.Tensor,
+            expert_indices: torch.Tensor,
+            expert_weights: torch.Tensor
+    ) -> dict:
+        """Compute the three auxiliary losses from the paper"""
+        batch_size, seq_len, num_experts = router_logits.shape
+        total_tokens = batch_size * seq_len
+
+        routing_probs = F.softmax(router_logits, dim=-1)
+
+        # 1. Expert-Level Balance Loss
+        # f_i: fraction of tokens routed to expert i
+        expert_mask = F.one_hot(expert_indices, num_classes=num_experts).float()
+        f_i = expert_mask.sum(dim=[0, 1, 2]) / (total_tokens * self.num_experts_per_tok)
+
+        # P_i: mean affinity score for expert i
+        P_i = routing_probs.mean(dim=[0, 1])
+
+        expert_balance_loss = (f_i * P_i).sum() * self.config.expert_balance_factor
+
+        # 2. Device-Level Balance Loss
+        device_assignment = self.expert_to_device.to(router_logits.device)
+        device_f = torch.zeros(self.num_devices, device=router_logits.device)
+        device_P = torch.zeros(self.num_devices, device=router_logits.device)
+
+        for device_id in range(self.num_devices):
+            device_experts = (device_assignment == device_id)
+            experts_on_device = device_experts.sum().item()
+
+            if experts_on_device > 0:
+                device_f[device_id] = f_i[device_experts].mean()
+                device_P[device_id] = P_i[device_experts].sum()
+
+        device_balance_loss = (device_f * device_P).sum() * self.config.device_balance_factor
+
+        # 3. Communication Balance Loss
+        # f''_i: fraction of tokens sent to device i
+        device_token_counts = torch.zeros(self.num_devices, device=router_logits.device)
+        for device_id in range(self.num_devices):
+            device_experts = (device_assignment == device_id)
+            # Count how many tokens are routed to experts on this device
+            device_expert_mask = expert_mask[:, :, :, device_experts].sum(dim=-1).clamp(min=0, max=1)
+            device_token_counts[device_id] = device_expert_mask.sum()
+
+        f_comm = device_token_counts / (total_tokens * self.max_devices_per_token)
+        comm_balance_loss = (f_comm * device_P).sum() * self.config.comm_balance_factor
+
+        return {
+            'expert_balance_loss': expert_balance_loss,
+            'device_balance_loss': device_balance_loss,
+            'comm_balance_loss': comm_balance_loss,
+            'total_aux_loss': expert_balance_loss + device_balance_loss + comm_balance_loss
+        }
+
+
+class DeepSeekMoE(nn.Module):
+    """Complete DeepSeekMoE module combining shared and routed experts"""
+
+    def __init__(self, config: MoEConfig):
+        super().__init__()
+        self.shared_experts = SharedExperts(config)
+        self.routed_experts = RoutedExperts(config)
+
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        """
+        Forward pass combining shared and routed experts.
+
+        h'_t = u_t + Σ FFN_shared(u_t) + Σ g_i,t * FFN_routed(u_t)
+        """
+        # Shared experts (always activated)
+        shared_output = self.shared_experts(hidden_states)
+
+        # Routed experts (sparse activation)
+        routed_output, aux_losses = self.routed_experts(hidden_states)
+
+        # Combine with residual
+        output = hidden_states + shared_output + routed_output
+
+        return output, aux_losses
+
+
+class MoEBlock(nn.Module):
+    """
+    Transformer block with DeepSeekMoE replacing the standard FFN.
+
+    Architecture:
+        Input -> RMSNorm -> Attention -> Residual
+                                      -> RMSNorm -> DeepSeekMoE -> Residual -> Output
+    """
+
+    def __init__(self, config: MoEConfig, attention_module):
+        super().__init__()
+        self.self_attn = attention_module
+        self.moe = DeepSeekMoE(config)
+        self.norm_eps = config.rms_norm_eps
+
+    def rms_norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """RMS normalization"""
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.square().mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.norm_eps)
+        return hidden_states.to(input_dtype)
+
+    def forward(
+            self,
+            cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]],
+            hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Forward pass with post-norm architecture.
+
+        Returns:
+            output: Transformed hidden states
+            aux_losses: Dictionary of auxiliary losses for training
+        """
+        # Self Attention with post-norm
+        attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+        hidden_states = self.rms_norm(hidden_states + attn_output)
+
+        # DeepSeekMoE with post-norm
+        moe_output, aux_losses = self.moe(hidden_states)
+        hidden_states = self.rms_norm(moe_output)
+
+        return hidden_states, aux_losses
