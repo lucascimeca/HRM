@@ -85,8 +85,7 @@ class MoEConfig(BaseModel):
 
     forward_dtype: str = "bfloat16"
 
-    """Configuration for DeepSeekMoE"""
-    hidden_size: int
+    # Configuration for DeepSeekMoE
     num_shared_experts: int = 2
     num_routed_experts: int = 160
     num_experts_per_tok: int = 6  # K_r in the paper
@@ -100,8 +99,7 @@ class MoEConfig(BaseModel):
     comm_balance_factor: float = 0.02  # α3
 
     # Other configs from your existing Block
-    num_heads: int = 32
-    # rms_norm_eps: float = 1e-6
+    # num_heads already declared above
     use_token_dropping: bool = True
     capacity_factor: float = 1.0
 
@@ -156,10 +154,13 @@ class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
         hidden_states = hidden_states + input_injection
 
         # Layers
-        aux_loss_agg = 0
+        aux_loss_agg = 0.0
         for layer in self.layers:
-            hidden_state, aux_losses = layer(hidden_states=hidden_states, **kwargs)
-            if aux_losses is not None: aux_loss_agg += aux_losses['total_aux_loss']
+            # Each layer returns (hidden_states_after_layer, aux_losses)
+            hidden_states, aux_losses = layer(hidden_states=hidden_states, **kwargs)
+            if aux_losses is not None:
+                # aux_losses expected to be a dict with key 'total_aux_loss'
+                aux_loss_agg = aux_loss_agg + aux_losses['total_aux_loss']
 
         return hidden_states, aux_loss_agg
 
@@ -199,8 +200,9 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         self.L_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
         
         # Initial states
-        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-        self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        # Register initial state vectors as proper buffers so they move with the module/device
+        self.register_buffer('H_init', trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.register_buffer('L_init', trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
 
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
@@ -368,7 +370,7 @@ class SharedExperts(nn.Module):
         output = torch.zeros_like(hidden_states)
         for expert in self.experts:
             output = output + expert(hidden_states)
-        return output
+        return output / len(self.experts)
 
 
 class RoutedExperts(nn.Module):
@@ -382,9 +384,12 @@ class RoutedExperts(nn.Module):
         self.max_devices_per_token = config.max_devices_per_token
         self.num_devices = config.num_devices
 
+        # Expert FFN size: allow a separate intermediate size for routed experts
+        expert_expansion_ratio = max(1.0, float(config.expert_intermediate_size) / float(config.hidden_size))
+
         # Create expert modules
         self.experts = nn.ModuleList([
-            SwiGLU(config.hidden_size, config.expansion)
+            SwiGLU(config.hidden_size, expert_expansion_ratio)
             for _ in range(self.num_experts)
         ])
 
@@ -392,23 +397,22 @@ class RoutedExperts(nn.Module):
         self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
 
         # Initialize router with small weights for stability
-        nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
+        nn.init.normal_(self.router.weight, mean=0.0, std=0.001)
 
-        # Ensure router dtype matches model dtype
-        # Will be overridden by model.to(dtype) if called later
+        # Ensure router dtype matches model dtype if specified
         if hasattr(config, 'dtype'):
             self.router = self.router.to(dtype=config.dtype)
 
-        # Device assignment: which experts belong to which device
-        experts_per_device = self.num_experts // self.num_devices
-        self.expert_to_device = torch.arange(self.num_experts) // experts_per_device
+        # Device assignment: evenly distribute experts to devices (robust to remainders)
+        # Example: E experts across D devices -> device id = expert_idx % D
+        self.expert_to_device = torch.arange(self.num_experts) % max(1, self.num_devices)
 
     def compute_routing_scores(
             self,
             hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Compute routing scores with device-limited routing.
+        Compute routing scores with device-limited routing (with safe fallbacks).
 
         Returns:
             expert_indices: [batch_size, seq_len, num_experts_per_tok]
@@ -417,27 +421,24 @@ class RoutedExperts(nn.Module):
         """
         batch_size, seq_len, hidden_size = hidden_states.shape
 
-        # Ensure dtype consistency - cast router weights to match input
-        router_dtype = next(self.router.parameters()).dtype
-        if hidden_states.dtype != router_dtype:
-            # Cast hidden_states to match router, or vice versa
-            # Typically you want to cast to the lower precision
-            if hidden_states.dtype == torch.bfloat16 or hidden_states.dtype == torch.float16:
-                self.router = self.router.to(dtype=hidden_states.dtype)
+        # Router logits in float32 for numerical stability, then clamp to avoid overflow in softmax
+        router_weight = self.router.weight.to(torch.float32)
+        router_logits = F.linear(hidden_states.to(torch.float32), router_weight)  # [B, S, E]
+        router_logits = router_logits.clamp(-20.0, 20.0)
+        routing_scores = F.softmax(router_logits, dim=-1)  # float32
 
-        # Compute affinity scores: s_i,t = Softmax(u_t^T * e_i)
-        router_logits = self.router(hidden_states)  # [B, S, num_experts]
-        routing_scores = F.softmax(router_logits, dim=-1)
+        # Decide whether to apply device-limited routing
+        apply_device_limit = self.max_devices_per_token < self.num_devices
+        if apply_device_limit:
+            # Lower-bound of experts per selected device (some devices may have one extra expert)
+            min_experts_per_device = self.num_experts // max(1, self.num_devices)
+            # If not enough experts would be available under device limit, skip masking to keep K valid
+            if self.max_devices_per_token * max(1, min_experts_per_device) < self.num_experts_per_tok:
+                apply_device_limit = False
 
-        if self.max_devices_per_token < self.num_devices:
+        if apply_device_limit:
             # Device-limited routing (VECTORIZED)
-            # Step 1: Aggregate scores per device
-            # Create a mapping tensor: [num_experts] -> device_id
             expert_to_device = self.expert_to_device.to(hidden_states.device)
-
-            # Reshape routing_scores for easier device aggregation
-            # [B, S, num_experts] -> [B, S, num_devices, experts_per_device]
-            experts_per_device = self.num_experts // self.num_devices
 
             # Aggregate scores per device using scatter_add
             device_scores = torch.zeros(
@@ -445,62 +446,64 @@ class RoutedExperts(nn.Module):
                 device=hidden_states.device,
                 dtype=routing_scores.dtype
             )
-
-            # Expand expert_to_device for broadcasting
-            # [num_experts] -> [B, S, num_experts]
             device_indices = expert_to_device.unsqueeze(0).unsqueeze(0).expand(
                 batch_size, seq_len, -1
             )
-
-            # Sum scores for each device
             device_scores.scatter_add_(
                 dim=2,
                 index=device_indices,
                 src=routing_scores
             )
 
-            # Step 2: Select top M devices per token
+            # Select top M devices per token
             _, selected_devices = torch.topk(
                 device_scores,
                 k=self.max_devices_per_token,
                 dim=-1
             )  # [B, S, M]
 
-            # Step 3: Create expert mask (VECTORIZED - no loops!)
-            # For each expert, check if its device is in the selected devices
-            # [B, S, num_experts] where True means expert's device is selected
-
-            # Get device for each expert: [num_experts]
-            expert_devices = expert_to_device  # [num_experts]
-
-            # Expand for broadcasting: [1, 1, num_experts]
-            expert_devices_expanded = expert_devices.unsqueeze(0).unsqueeze(0)
-
-            # Expand selected_devices for comparison: [B, S, M, 1]
+            # Create expert mask: True if expert's device is selected
+            expert_devices_expanded = expert_to_device.unsqueeze(0).unsqueeze(0)
             selected_devices_expanded = selected_devices.unsqueeze(-1)
-
-            # Check if each expert's device is in selected devices
-            # [B, S, 1, num_experts] == [B, S, M, 1] -> [B, S, M, num_experts]
-            # Then reduce over M dimension with any()
-            device_mask = (expert_devices_expanded == selected_devices_expanded).any(dim=2)
-            # Result: [B, S, num_experts] - True if expert's device was selected
+            device_mask = (expert_devices_expanded == selected_devices_expanded).any(dim=2)  # [B, S, E]
 
             # Mask out experts not on selected devices
             masked_scores = routing_scores.masked_fill(~device_mask, float('-inf'))
         else:
             masked_scores = routing_scores
 
-        # Step 2: Select top-K experts from allowed experts
+        # Top-K experts among allowed experts
+        # Note: if all masked (shouldn't happen), we will fallback below.
         expert_weights, expert_indices = torch.topk(
             masked_scores,
-            k=self.num_experts_per_tok,
+            k=min(self.num_experts_per_tok, self.num_experts),
             dim=-1
         )  # [B, S, K]
 
-        # Renormalize weights
-        expert_weights = F.softmax(expert_weights, dim=-1)
+        # Fallback if a token had no finite scores after masking (all -inf)
+        finite_mask = torch.isfinite(expert_weights)
+        any_finite = finite_mask.any(dim=-1, keepdim=True)  # [B, S, 1]
+        if not torch.all(any_finite):
+            # Recompute using unmasked scores for the affected tokens
+            fallback_scores = routing_scores  # [B, S, E]
+            fw, fi = torch.topk(
+                fallback_scores,
+                k=min(self.num_experts_per_tok, self.num_experts),
+                dim=-1
+            )
+            # Replace only where none finite
+            replace_mask = ~any_finite
+            expert_weights = torch.where(replace_mask, fw, expert_weights)
+            expert_indices = torch.where(replace_mask, fi, expert_indices)
 
-        return expert_indices, expert_weights, router_logits
+        # Stable softmax on selected weights (float32)
+        w = expert_weights.to(torch.float32)
+        w = w - w.amax(dim=-1, keepdim=True)
+        exp_w = torch.exp(w)
+        denom = exp_w.sum(dim=-1, keepdim=True) + 1e-9
+        expert_weights = (exp_w / denom).to(hidden_states.dtype)
+
+        return expert_indices, expert_weights, router_logits.to(hidden_states.dtype)
 
     def forward(
             self,
@@ -526,40 +529,28 @@ class RoutedExperts(nn.Module):
         # Initialize output
         output = torch.zeros_like(hidden_states_flat)  # [B*S, H]
 
-        # VECTORIZED APPROACH: Process all tokens for each expert
-        # This avoids .item() calls and is much faster
+        # Process tokens per expert
         for expert_idx in range(self.num_experts):
-            # Find which tokens route to this expert
             expert_mask = (expert_indices_flat == expert_idx)  # [B*S, K]
+            if not expert_mask.any():
+                continue
 
-            # Get the positions where this expert is used
             token_indices, k_indices = torch.where(expert_mask)
+            expert_inputs = hidden_states_flat[token_indices]  # [N, H]
+            expert_weights_batch = expert_weights_flat[token_indices, k_indices]  # [N]
 
-            if len(token_indices) == 0:
-                continue  # No tokens route to this expert
+            expert_outputs = self.experts[expert_idx](expert_inputs)  # [N, H]
+            weighted_outputs = expert_outputs * expert_weights_batch.unsqueeze(-1)
 
-            # Get inputs for all tokens that use this expert
-            expert_inputs = hidden_states_flat[token_indices]  # [num_routed, H]
-
-            # Get weights for these routings
-            expert_weights_batch = expert_weights_flat[token_indices, k_indices]  # [num_routed]
-
-            # Apply expert once for all routed tokens
-            expert_outputs = self.experts[expert_idx](expert_inputs)  # [num_routed, H]
-
-            # Weight the outputs
-            weighted_outputs = expert_outputs * expert_weights_batch.unsqueeze(-1)  # [num_routed, H]
-
-            # Scatter add to output (handles multiple experts per token)
             output.index_add_(0, token_indices, weighted_outputs)
 
         output = output.view(batch_size, seq_len, hidden_size)
 
-        # Compute auxiliary losses for load balancing
+        # Compute auxiliary losses for load balancing (use float32 for stability)
         aux_losses = self._compute_auxiliary_losses(
-            router_logits,
+            router_logits.to(torch.float32),
             expert_indices,
-            expert_weights
+            expert_weights.to(torch.float32)
         )
 
         return output, aux_losses
@@ -570,55 +561,49 @@ class RoutedExperts(nn.Module):
             expert_indices: torch.Tensor,
             expert_weights: torch.Tensor
     ) -> dict:
-        """Compute the three auxiliary losses from the paper"""
+        """Compute the three auxiliary losses with basic stability tweaks"""
         batch_size, seq_len, num_experts = router_logits.shape
-        total_tokens = batch_size * seq_len
+        total_tokens = max(1, batch_size * seq_len)
 
-        routing_probs = F.softmax(router_logits, dim=-1)
+        routing_probs = F.softmax(router_logits.clamp(-20.0, 20.0), dim=-1)
 
         # 1. Expert-Level Balance Loss
-        # f_i: fraction of tokens routed to expert i
-        expert_mask = F.one_hot(expert_indices, num_classes=num_experts).float()
-        f_i = expert_mask.sum(dim=[0, 1, 2]) / (total_tokens * self.num_experts_per_tok)
-
-        # P_i: mean affinity score for expert i
+        expert_mask = F.one_hot(expert_indices, num_classes=num_experts).to(router_logits.dtype)
+        f_i = expert_mask.sum(dim=[0, 1, 2]) / (total_tokens * max(1, self.num_experts_per_tok))
         P_i = routing_probs.mean(dim=[0, 1])
-
         expert_balance_loss = (f_i * P_i).sum() * self.config.expert_balance_factor
 
         # 2. Device-Level Balance Loss
         device_assignment = self.expert_to_device.to(router_logits.device)
-        device_f = torch.zeros(self.num_devices, device=router_logits.device)
-        device_P = torch.zeros(self.num_devices, device=router_logits.device)
+        device_f = torch.zeros(self.num_devices, device=router_logits.device, dtype=router_logits.dtype)
+        device_P = torch.zeros(self.num_devices, device=router_logits.device, dtype=router_logits.dtype)
 
         for device_id in range(self.num_devices):
             device_experts = (device_assignment == device_id)
-            experts_on_device = device_experts.sum().item()
-
+            experts_on_device = int(device_experts.sum().item())
             if experts_on_device > 0:
                 device_f[device_id] = f_i[device_experts].mean()
-                device_P[device_id] = P_i[device_experts].sum()
+                device_P[device_id] = P_i[device_experts].mean() * experts_on_device
 
         device_balance_loss = (device_f * device_P).sum() * self.config.device_balance_factor
 
         # 3. Communication Balance Loss
-        # f''_i: fraction of tokens sent to device i
-        device_token_counts = torch.zeros(self.num_devices, device=router_logits.device)
+        device_token_counts = torch.zeros(self.num_devices, device=router_logits.device, dtype=router_logits.dtype)
         for device_id in range(self.num_devices):
             device_experts = (device_assignment == device_id)
-            # Count how many tokens are routed to experts on this device
-            device_expert_mask = expert_mask[:, :, :, device_experts].sum(dim=-1).clamp(min=0, max=1)
-            device_token_counts[device_id] = device_expert_mask.sum()
+            if device_experts.any():
+                device_expert_mask = expert_mask[:, :, :, device_experts].sum(dim=-1).clamp(min=0, max=1)
+                device_token_counts[device_id] = device_expert_mask.sum()
 
-        # Normalize by expected number of tokens per device
-        f_comm = device_token_counts / (total_tokens * self.max_devices_per_token + 1e-10)
+        f_comm = device_token_counts / (total_tokens * max(1, self.max_devices_per_token))
         comm_balance_loss = (f_comm * device_P).sum() * self.config.comm_balance_factor
 
+        total_aux = expert_balance_loss + device_balance_loss + comm_balance_loss
         return {
             'expert_balance_loss': expert_balance_loss,
             'device_balance_loss': device_balance_loss,
             'comm_balance_loss': comm_balance_loss,
-            'total_aux_loss': expert_balance_loss + device_balance_loss + comm_balance_loss
+            'total_aux_loss': total_aux
         }
 
 
@@ -690,8 +675,8 @@ class MoEBlock(nn.Module):
         attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
         hidden_states = self.rms_norm(hidden_states + attn_output)
 
-        # DeepSeekMoE with post-norm
+        # DeepSeekMoE with post-norm (add residual then normalize)
         moe_output, aux_losses = self.moe(hidden_states)
-        hidden_states = self.rms_norm(moe_output)
+        hidden_states = self.rms_norm(hidden_states + moe_output)
 
         return hidden_states, aux_losses
