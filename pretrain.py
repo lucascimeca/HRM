@@ -239,6 +239,9 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         for param in train_state.model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad)
+
+    # Gradient clipping
+    # torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), max_norm=1.0)
             
     # Apply optimizer
     lr_this_step = None    
