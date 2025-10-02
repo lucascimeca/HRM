@@ -216,6 +216,42 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
     )
 
 
+def _allreduce_and_average_grads(model: nn.Module, world_size: int):
+    """Synchronize gradients across ranks safely.
+
+    Ensures all ranks call the same collectives with identically-shaped tensors,
+    even when some params have no grads (e.g., due to routing/ACT/MoE) or sparse grads.
+    """
+    if world_size <= 1 or not dist.is_initialized():
+        return
+
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        grad = param.grad
+        had_none = grad is None
+        is_sparse = False if grad is None else getattr(grad, "is_sparse", False)
+
+        if had_none:
+            reduce_buf = torch.zeros_like(param.data)
+        elif is_sparse:
+            reduce_buf = grad.to_dense()  # densify for all_reduce
+        else:
+            reduce_buf = grad
+
+        # Ensure identical dtype across ranks (match parameter dtype)
+        if reduce_buf.dtype != param.dtype:
+            reduce_buf = reduce_buf.to(dtype=param.dtype)
+
+        dist.all_reduce(reduce_buf, op=dist.ReduceOp.SUM)
+        reduce_buf /= float(world_size)
+
+        if had_none or is_sparse:
+            param.grad = reduce_buf
+        else:
+            grad.copy_(reduce_buf)
+
+
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
@@ -234,11 +270,9 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
     ((1 / global_batch_size) * loss).backward()
 
-    # Allreduce
+    # Allreduce - synchronize every param in lockstep
     if world_size > 1:
-        for param in train_state.model.parameters():
-            if param.grad is not None:
-                dist.all_reduce(param.grad)
+        _allreduce_and_average_grads(train_state.model, world_size)
 
     # Gradient clipping
     # torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), max_norm=1.0)
@@ -325,22 +359,45 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
             torch.save(all_preds, os.path.join(config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}"))
 
         # Logging
-        # Reduce to rank 0
-        if metric_values is not None:
-            if world_size > 1:
-                dist.reduce(metric_values, dst=0)
-            
-            if rank == 0:
-                reduced_metrics = metric_values.cpu().numpy()
-                reduced_metrics = {set_name: {metric_name: reduced_metrics[set_id, metric_id] for metric_id, metric_name in enumerate(metric_keys)}
-                                   for set_id, set_name in enumerate(set_ids)}
-                
-                # Postprocess
-                for set_name, metrics in reduced_metrics.items():
-                    count = metrics.pop("count")
-                    reduced_metrics[set_name] = {k: v / count for k, v in metrics.items()}
+        # Reduce to rank 0 — ensure every rank participates with identical shapes
+        if world_size > 1:
+            # share metric_keys across ranks; pick first non-empty from gathered
+            local_keys = metric_keys if metric_values is not None else None
+            gathered_keys: List[Optional[List[str]]] = [None for _ in range(world_size)]
+            dist.all_gather_object(gathered_keys, local_keys)
+            resolved_keys = None
+            for ks in gathered_keys:
+                if ks is not None and len(ks):
+                    resolved_keys = ks
+                    break
+            if resolved_keys is None:
+                # No eval batches on any rank
+                return
+            if metric_values is None:
+                # Create a zero tensor so reduce can proceed
+                metric_values = torch.zeros((len(set_ids), len(resolved_keys)), dtype=torch.float32, device="cuda")
+                metric_keys = resolved_keys
+            else:
+                # Optional: sanity check equal ordering
+                # If not equal, we could reindex here; assuming identical keys across ranks
+                pass
+            dist.reduce(metric_values, dst=0)
+        else:
+            if metric_values is None:
+                return
+            # single-rank: nothing to reduce
 
-                return reduced_metrics
+        if rank == 0:
+            reduced_metrics = metric_values.cpu().numpy()
+            reduced_metrics = {set_name: {metric_name: reduced_metrics[set_id, metric_id] for metric_id, metric_name in enumerate(metric_keys)}
+                               for set_id, set_name in enumerate(set_ids)}
+
+            # Postprocess
+            for set_name, metrics in reduced_metrics.items():
+                count = metrics.pop("count")
+                reduced_metrics[set_name] = {k: v / count for k, v in metrics.items()}
+
+            return reduced_metrics
 
 
 def save_code_and_config(config: PretrainConfig):
