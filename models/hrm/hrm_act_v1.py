@@ -56,6 +56,13 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
 
     forward_dtype: str = "bfloat16"
 
+    # Optional H-level MoE routing config (disabled by default)
+    use_H_moe: bool = False  # If true, replace H_level with MoE routing over sublayers
+    H_moe_num_experts: int = 0  # Number of experts per H-layer when MoE is enabled
+    H_moe_top_k: int = 2        # How many experts to activate per sequence
+    H_moe_hidden_ratio: Optional[float] = None  # If None, computed as ~ 1/sqrt(H_moe_top_k)
+    H_moe_aux_loss_weight: float = 0.01  # Load-balancing aux loss weight
+
 
 class HierarchicalReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
@@ -99,6 +106,163 @@ class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
         return hidden_states
 
 
+# --- Optional MoE routing over smaller sublayers (H-level only) ---
+class ACTV1SlimExpertBlock(nn.Module):
+    """
+    A smaller expert block that operates in a bottleneck subspace with size h_sub = num_heads_sub * parent_head_dim.
+    It reuses the parent's head_dim to stay compatible with RoPE cos/sin tensors while reducing parameter count.
+    """
+    def __init__(self, *, parent_hidden_size: int, parent_num_heads: int, parent_expansion: float, norm_eps: float, num_heads_sub: int):
+        super().__init__()
+        assert parent_hidden_size % parent_num_heads == 0
+        self.norm_eps = norm_eps
+        self.parent_hidden_size = parent_hidden_size
+        self.parent_head_dim = parent_hidden_size // parent_num_heads
+        self.num_heads_sub = max(1, int(num_heads_sub))
+        self.hidden_sub = self.num_heads_sub * self.parent_head_dim
+
+        # Bottleneck in/out projections
+        self.down_proj = CastedLinear(parent_hidden_size, self.hidden_sub, bias=False)
+        self.up_proj   = CastedLinear(self.hidden_sub, parent_hidden_size, bias=False)
+
+        # Internal transformer block at reduced dim using the parent's head_dim for RoPE compatibility
+        self.self_attn = Attention(
+            hidden_size=self.hidden_sub,
+            head_dim=self.parent_head_dim,
+            num_heads=self.num_heads_sub,
+            num_key_value_heads=self.num_heads_sub,
+            causal=False
+        )
+        self.mlp = SwiGLU(hidden_size=self.hidden_sub, expansion=parent_expansion)
+
+    def forward(self, hidden_states: torch.Tensor, cos_sin: CosSin) -> torch.Tensor:
+        # Down-project
+        h = self.down_proj(hidden_states)
+        # Internal block (residual + norms inside subspace)
+        h = rms_norm(h + self.self_attn(cos_sin=cos_sin, hidden_states=h), variance_epsilon=self.norm_eps)
+        h = rms_norm(h + self.mlp(h), variance_epsilon=self.norm_eps)
+        # Up-project back to parent space
+        out = self.up_proj(h)
+        return out  # Return the transform; the caller decides how to mix and apply residuals
+
+
+class TopKSequenceRouter(nn.Module):
+    """
+    Per-sequence router: compute expert scores from the first position embedding (index 0) and select top-k experts.
+    Returns (topk_idx, topk_weights) and an aux load-balancing loss.
+    """
+    def __init__(self, hidden_size: int, num_experts: int, top_k: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = max(1, int(top_k))
+        self.gate = CastedLinear(hidden_size, num_experts, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # hidden_states: [B, S, H]; use position 0 summary
+        gate_logits = self.gate(hidden_states[:, 0])  # [B, E]
+        gate_probs = F.softmax(gate_logits.to(torch.float32), dim=-1)  # [B, E]
+
+        topk_vals, topk_idx = torch.topk(gate_probs, k=min(self.top_k, self.num_experts), dim=-1)  # [B, K], [B, K]
+        # Renormalize to sum 1 over selected experts
+        topk_weights = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        # Load-balancing aux loss (Switch-style): encourage balanced importance and load
+        B, E = gate_probs.shape
+        K = topk_idx.shape[-1]
+        # importance: sum of probabilities per expert
+        importance = gate_probs.sum(dim=0) / max(B, 1)
+        # load: fraction of times an expert is selected
+        sel_mask = torch.zeros((B, E), dtype=gate_probs.dtype, device=gate_probs.device)
+        sel_mask.scatter_(dim=-1, index=topk_idx, src=torch.ones_like(topk_vals))
+        load = sel_mask.sum(dim=0) / max(B * K, 1)
+        aux_loss = (self.num_experts * (importance * load)).sum()
+        return topk_idx, topk_weights, aux_loss
+
+
+class ACTV1MoERoutingLayer(nn.Module):
+    """
+    A routing layer that mixes multiple slim expert blocks.
+    Each forward computes a weighted mixture of expert transforms and applies a residual update with RMS norm.
+    """
+    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config):
+        super().__init__()
+        assert config.H_moe_num_experts > 0
+        parent_hidden = config.hidden_size
+        parent_heads = config.num_heads
+
+        # Determine sub heads using hidden ratio; keep head_dim constant
+        if config.H_moe_hidden_ratio is None:
+            # Roughly keep active params comparable: choose ~ 1/sqrt(top_k) ratio
+            head_ratio = 1.0 / max(math.sqrt(max(config.H_moe_top_k, 1)), 1.0)
+        else:
+            head_ratio = max(1e-3, float(config.H_moe_hidden_ratio))
+        num_heads_sub = max(1, int(round(parent_heads * head_ratio)))
+        # Ensure at least 1 and at most parent heads
+        num_heads_sub = min(num_heads_sub, parent_heads)
+
+        self.norm_eps = config.rms_norm_eps
+        self.router = TopKSequenceRouter(hidden_size=parent_hidden, num_experts=config.H_moe_num_experts, top_k=config.H_moe_top_k)
+        self.experts = nn.ModuleList([
+            ACTV1SlimExpertBlock(
+                parent_hidden_size=parent_hidden,
+                parent_num_heads=parent_heads,
+                parent_expansion=config.expansion,
+                norm_eps=config.rms_norm_eps,
+                num_heads_sub=num_heads_sub
+            ) for _ in range(config.H_moe_num_experts)
+        ])
+
+    def forward(self, hidden_states: torch.Tensor, cos_sin: CosSin, input_injection: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Input injection (add) first to match ReasoningModule
+        hidden_states = hidden_states + input_injection
+
+        # Router weights per sequence (sparse top-k)
+        topk_idx, topk_weights, aux_loss = self.router(hidden_states)  # [B, K], [B, K]
+
+        B, S, H = hidden_states.shape
+        E = len(self.experts)
+        mixed = torch.zeros_like(hidden_states)
+
+        # Build dense per-expert weights matrix W_full: [B, E]
+        W_full = hidden_states.new_zeros((B, E), dtype=topk_weights.dtype)
+        W_full.scatter_add_(dim=1, index=topk_idx, src=topk_weights)
+
+        # For each expert, compute only for sequences that selected it
+        for e, expert in enumerate(self.experts):
+            b_mask = W_full[:, e] > 0
+            if b_mask.any():
+                b_idx = torch.nonzero(b_mask, as_tuple=False).squeeze(-1)
+                hs_e = hidden_states.index_select(dim=0, index=b_idx)
+                out_e = expert(hidden_states=hs_e, cos_sin=cos_sin)  # [be, S, H]
+                # Cast weights to match out_e dtype to avoid dtype mismatch in index_add_
+                w_e = W_full.index_select(dim=0, index=b_idx)[:, e].unsqueeze(-1).unsqueeze(-1).to(out_e.dtype)
+                mixed.index_add_(dim=0, index=b_idx, source=out_e * w_e)
+
+        # Residual + norm at parent space
+        out = rms_norm(hidden_states + mixed, variance_epsilon=self.norm_eps)
+        return out, aux_loss
+
+
+class HierarchicalReasoningModel_ACTV1MoEReasoningModule(nn.Module):
+    """Drop-in replacement for H-level reasoning with MoE routing across sublayers."""
+    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config):
+        super().__init__()
+        self.layers = nn.ModuleList([ACTV1MoERoutingLayer(config) for _ in range(config.H_layers)])
+        self.last_aux_loss: Optional[torch.Tensor] = None
+
+    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
+        cos_sin = kwargs.get("cos_sin", None)
+        total_aux = None
+        for layer in self.layers:
+            hidden_states, aux = layer(hidden_states=hidden_states, cos_sin=cos_sin, input_injection=input_injection)
+            total_aux = aux if total_aux is None else (total_aux + aux)
+        # Store for retrieval by caller (normalize by number of layers for stability)
+        if total_aux is not None and len(self.layers) > 0:
+            total_aux = total_aux / len(self.layers)
+        self.last_aux_loss = total_aux
+        return hidden_states
+
+
 class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
     def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
         super().__init__()
@@ -130,7 +294,10 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             raise NotImplementedError()
 
         # Reasoning Layers
-        self.H_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.H_layers)])
+        if self.config.use_H_moe and (self.config.H_moe_num_experts > 0):
+            self.H_level = HierarchicalReasoningModel_ACTV1MoEReasoningModule(self.config)
+        else:
+            self.H_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.H_layers)])
         self.L_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
         
         # Initial states
@@ -279,5 +446,11 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
                 next_q_halt_logits, next_q_continue_logits = self.inner(new_inner_carry, new_current_data)[-1]
                 
                 outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+
+        # Attach MoE aux loss if present (only H-level MoE produces it)
+        if getattr(self.inner, "H_level", None) is not None and hasattr(self.inner.H_level, "last_aux_loss"):
+            aux = self.inner.H_level.last_aux_loss
+            if aux is not None:
+                outputs["moe_aux_loss"] = aux  # keep grad so loss head can optimize router
 
         return HierarchicalReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs

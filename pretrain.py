@@ -45,6 +45,8 @@ class ArchConfig(pydantic.BaseModel):
 
 
 class PretrainConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra='allow')  # accept any leftover extras defensively
+
     # Config
     arch: ArchConfig
     # Data
@@ -132,8 +134,8 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     with torch.device("cuda"):
         model: nn.Module = model_cls(model_cfg)
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
-        if "DISABLE_COMPILE" not in os.environ:
-            model = torch.compile(model, dynamic=False)  # type: ignore
+        # if "DISABLE_COMPILE" not in os.environ:
+        #     model = torch.compile(model, dynamic=False)  # type: ignore
 
         # Broadcast parameters from rank 0
         if world_size > 1:
@@ -365,8 +367,41 @@ def save_code_and_config(config: PretrainConfig):
 
 
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> PretrainConfig:
+    def _forward_root_moe_flags(cfg: DictConfig):
+        # Forward root-level MoE flags into arch and arch.loss, if present
+        if "arch" not in cfg:
+            return
+        moe_model_keys = [
+            "use_H_moe",
+            "H_moe_num_experts",
+            "H_moe_top_k",
+            "H_moe_hidden_ratio",
+            "H_moe_aux_loss_weight",
+        ]
+        # Ensure nested dicts
+        if "loss" not in cfg["arch"]:
+            cfg["arch"]["loss"] = {}
+        # Move model MoE keys
+        for k in moe_model_keys:
+            if k in cfg and cfg[k] is not None:
+                cfg["arch"][k] = cfg[k]
+                # remove root to avoid extra keys in Pydantic parse
+                try:
+                    del cfg[k]
+                except Exception:
+                    pass
+        # Move loss-head weight if specified at root
+        if "moe_aux_loss_weight" in cfg and cfg["moe_aux_loss_weight"] is not None:
+            cfg["arch"]["loss"]["moe_aux_loss_weight"] = cfg["moe_aux_loss_weight"]
+            try:
+                del cfg["moe_aux_loss_weight"]
+            except Exception:
+                pass
+
     objects = [None]
     if rank == 0:
+        # mutate a copy-like structure of the dictconfig
+        _forward_root_moe_flags(hydra_config)
         config = PretrainConfig(**hydra_config)  # type: ignore
 
         # Naming

@@ -34,15 +34,28 @@ def stablemax_cross_entropy(logits, labels, ignore_index: int = -100):
 def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
     # Cast logits to f32
     # Flatten logits
-    return F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
+    return F.cross_entropy(logits.to(torch.float32).reshape(-1, logits.shape[-1]), labels.to(torch.long).reshape(-1), ignore_index=ignore_index, reduction="none").reshape(labels.shape)
 
 
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str):
+    def __init__(self, model: nn.Module, loss_type: str, moe_aux_loss_weight: Optional[float] = None):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
-        
+        self._moe_aux_loss_weight = moe_aux_loss_weight
+
+    @property
+    def moe_aux_loss_weight(self) -> float:
+        # Prefer explicit config in loss head; else fall back to model config if available
+        if self._moe_aux_loss_weight is not None:
+            return float(self._moe_aux_loss_weight)
+        cfg_w = None
+        try:
+            cfg_w = getattr(getattr(self.model, "config", object()), "H_moe_aux_loss_weight", None)
+        except Exception:
+            cfg_w = None
+        return float(cfg_w) if cfg_w is not None else 0.0
+
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
 
@@ -95,7 +108,13 @@ class ACTLossHead(nn.Module):
 
             metrics["q_continue_loss"] = q_continue_loss.detach()
 
+        # Optional MoE auxiliary load-balancing loss
+        moe_aux_loss_term = 0
+        if "moe_aux_loss" in outputs and self.moe_aux_loss_weight != 0.0:
+            moe_aux_loss_term = self.moe_aux_loss_weight * outputs["moe_aux_loss"]
+            metrics["moe_aux_loss"] = outputs["moe_aux_loss"].detach()
+
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + moe_aux_loss_term, metrics, detached_outputs, new_carry.halted.all()
