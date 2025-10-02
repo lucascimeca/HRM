@@ -90,7 +90,7 @@ class MoEConfig(BaseModel):
     num_routed_experts: int = 160
     num_experts_per_tok: int = 6  # K_r in the paper
     expert_intermediate_size: int = 1536
-    num_devices: int = 8
+    num_devices: int = 1
     max_devices_per_token: int = 3  # M in the paper
 
     # Balance loss coefficients
