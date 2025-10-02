@@ -576,10 +576,16 @@ class RoutedExperts(nn.Module):
         # 1. Expert-Level Balance Loss
         # f_i: fraction of tokens routed to expert i
         expert_mask = F.one_hot(expert_indices, num_classes=num_experts).float()
-        f_i = expert_mask.sum(dim=[0, 1, 2]) / (total_tokens * self.num_experts_per_tok)
+
+        # Sum over batch and sequence, but normalize properly
+        token_counts_per_expert = expert_mask.sum(dim=[0, 1, 2])  # [num_experts]
+        total_token_expert_pairs = total_tokens * self.num_experts_per_tok
+
+        # Avoid division by zero
+        f_i = token_counts_per_expert / (total_token_expert_pairs + 1e-10)
 
         # P_i: mean affinity score for expert i
-        P_i = routing_probs.mean(dim=[0, 1])
+        P_i = routing_probs.mean(dim=[0, 1])  # [num_experts]
 
         expert_balance_loss = (f_i * P_i).sum() * self.config.expert_balance_factor
 
@@ -607,8 +613,14 @@ class RoutedExperts(nn.Module):
             device_expert_mask = expert_mask[:, :, :, device_experts].sum(dim=-1).clamp(min=0, max=1)
             device_token_counts[device_id] = device_expert_mask.sum()
 
-        f_comm = device_token_counts / (total_tokens * self.max_devices_per_token)
+        # Normalize by expected number of tokens per device
+        f_comm = device_token_counts / (total_tokens * self.max_devices_per_token + 1e-10)
         comm_balance_loss = (f_comm * device_P).sum() * self.config.comm_balance_factor
+
+        # Clamp losses to prevent explosion
+        expert_balance_loss = torch.clamp(expert_balance_loss, max=10.0)
+        device_balance_loss = torch.clamp(device_balance_loss, max=10.0)
+        comm_balance_loss = torch.clamp(comm_balance_loss, max=10.0)
 
         return {
             'expert_balance_loss': expert_balance_loss,

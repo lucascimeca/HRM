@@ -83,6 +83,9 @@ class ACTLossHead(nn.Module):
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) / loss_divisor).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
 
+        if aux_loss is None:
+            aux_loss = torch.tensor(0.0, device=lm_loss.device, dtype=lm_loss.dtype)
+
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
