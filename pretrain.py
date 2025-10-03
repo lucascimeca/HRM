@@ -179,6 +179,53 @@ def cosine_schedule_with_warmup_lr_lambda(
     return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
 
 
+# --- Active parameter counting (accounts for MoE by excluding inactive experts) ---
+def _safe_num_params(module: nn.Module) -> int:
+    return sum(p.numel() for p in module.parameters())
+
+
+def compute_active_param_count(model_with_loss_head: nn.Module) -> int:
+    """Compute active parameters for current architecture.
+
+    If H-level MoE is present, counts only top-k experts per H-layer as active
+    (plus the always-on router). Otherwise equals total parameter count.
+    This function is robust to architecture differences and avoids extra imports.
+    """
+    total = _safe_num_params(model_with_loss_head)
+    active = total
+
+    # Try to get to the inner HRM model and its H-level module
+    try:
+        base_model = getattr(model_with_loss_head, "model", None)  # ACT loss head wrapper
+        inner = getattr(base_model, "inner", None)
+        H_level = getattr(inner, "H_level", None)
+        cfg = getattr(base_model, "config", None)
+        top_k = int(getattr(cfg, "H_moe_top_k", 0)) if cfg is not None else 0
+
+        # Detect MoE reasoning module by duck-typing
+        layers = getattr(H_level, "layers", None)
+        if layers is None:
+            return active
+
+        for layer in layers:
+            experts = getattr(layer, "experts", None)
+            if experts is None:
+                # Not an MoE layer
+                continue
+            num_experts = len(experts)
+            if num_experts == 0:
+                continue
+            # Total parameters in all experts in this layer
+            experts_total = _safe_num_params(experts)
+            per_expert = _safe_num_params(experts[0])
+            k = max(0, min(top_k, num_experts))
+            # Remove all experts, add back k experts worth of params
+            active = active - experts_total + k * per_expert
+        return active
+    except Exception:
+        return total
+
+
 def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int):
     # Estimated total training steps
     total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
@@ -520,6 +567,11 @@ def launch(hydra_config: DictConfig):
 
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
+
+        # Log active parameter count (accounts for MoE)
+        active_param_count = compute_active_param_count(train_state.model)
+        wandb.log({"num_active_params": active_param_count}, step=0)
+
         save_code_and_config(config)
 
     # Training Loop
