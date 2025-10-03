@@ -43,6 +43,10 @@ set -euo pipefail
 # optional: echo commands as they run
 # set -x
 
+# Determine repo root and cd there so relative paths work regardless of submission dir
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+REPO_ROOT="${SCRIPT_DIR}/.."
+cd "${REPO_ROOT}"
 
 # 4) determine local world size = # GPUs on this node
 #    Prefer Slurm's view; fallback to nvidia-smi count if unset.
@@ -58,15 +62,6 @@ fi
 
 echo "GPUS_PER_NODE=${GPUS_PER_NODE}"
 
-# now assign positional args
-#DATASET="$1"
-#FREQ_SLOPE="$2"
-#EXP_NAME="$3"
-#SEED="$4"
-#
-#echo "[DEBUG] 1=$1, 2=$2, 3=$3, 4=$4" >&2
-
-
 # inside your job, before launching torchrun
 mkdir -p "$PWD/libcuda_shim"
 
@@ -81,13 +76,22 @@ fi
 
 export LD_LIBRARY_PATH="$PWD/libcuda_shim:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 
-
-torchrun --nproc_per_node=${GPUS_PER_NODE} ../pretrain.py \
-    data_path=$SCRATCH/projects/HRM/data/sudoku-extreme-1k-aug-1000 \
-    epochs=20000 \
-    eval_interval=2000 \
-    global_batch_size=384 \
-    lr=7e-5 \
-    puzzle_emb_lr=7e-5 \
-    weight_decay=1.0 \
+# Default overrides (can be overridden by passing hydra args to this script)
+DEFAULT_OVERRIDES=(
+    data_path=$SCRATCH/projects/HRM/data/sudoku-extreme-1k-aug-1000
+    epochs=20000
+    eval_interval=2000
+    global_batch_size=384
+    lr=7e-5
+    puzzle_emb_lr=7e-5
+    weight_decay=1.0
     puzzle_emb_weight_decay=1.0
+)
+
+# Forward any additional overrides (e.g., use_H_moe, H_moe_*). Caller can pass: use_H_moe=True H_moe_num_experts=64 ...
+EXTRA_OVERRIDES=("$@")
+
+# Launch
+torchrun --nproc_per_node=${GPUS_PER_NODE} pretrain.py \
+    "${DEFAULT_OVERRIDES[@]}" \
+    "${EXTRA_OVERRIDES[@]}"
