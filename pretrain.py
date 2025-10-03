@@ -586,6 +586,8 @@ def launch(hydra_config: DictConfig):
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                # Log MoE usage histograms (if available)
+                _log_moe_usage_histograms(train_state, WORLD_SIZE, RANK)
 
         ############ Evaluation
         train_state.model.eval()
@@ -603,6 +605,68 @@ def launch(hydra_config: DictConfig):
         dist.destroy_process_group()
     wandb.finish()
 
+
+def _log_moe_usage_histograms(train_state: TrainState, world_size: int, rank: int):
+    """Aggregate per-expert usage across ranks and log per-layer histograms to Weights & Biases.
+
+    For each H-level MoE layer, we expect attributes on the routing layer:
+      - last_counts: Tensor[E] with number of selections per expert in the last batch
+      - last_batch_size: int B for that batch
+      - last_top_k: int top_k used by the router
+    We compute global selection rate = total_counts / (sum_ranks B*top_k) and log as a bar plot.
+    """
+    try:
+        base_model = getattr(train_state.model, "model", None)
+        inner = getattr(base_model, "inner", None)
+        H_level = getattr(inner, "H_level", None)
+        layers = getattr(H_level, "layers", None)
+    except Exception:
+        return
+    if layers is None:
+        return
+
+    logs = {}
+    for li, layer in enumerate(layers):
+        counts = getattr(layer, "last_counts", None)
+        B = getattr(layer, "last_batch_size", None)
+        top_k = getattr(layer, "last_top_k", None)
+        if counts is None or B is None or top_k is None or B == 0 or top_k == 0:
+            continue
+
+        # Choose a device suitable for collectives
+        if counts.is_cuda:
+            device = counts.device
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+
+        counts_t = counts.to(device=device, dtype=torch.float32).clone()
+        denom_t = torch.tensor([float(B * top_k)], device=device, dtype=torch.float32)
+
+        if world_size > 1 and dist.is_initialized():
+            dist.all_reduce(counts_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(denom_t, op=dist.ReduceOp.SUM)
+
+        # Only rank 0 performs W&B logging
+        if rank != 0:
+            continue
+
+        total_selects = float(denom_t.item())
+        if total_selects <= 0:
+            continue
+        rate = (counts_t / total_selects).cpu().numpy()
+
+        # Prefer a bar plot; fall back to scalar logs if plotting fails
+        try:
+            table = wandb.Table(data=[[int(i), float(rate[i])] for i in range(len(rate))], columns=["expert", "rate"])
+            logs[f"moe/usage_layer_{li}"] = wandb.plot.bar(table, "expert", "rate", title=f"MoE Usage Layer {li}")
+        except Exception:
+            for i, v in enumerate(rate.tolist()):
+                logs[f"moe/usage_layer_{li}/expert_{i}"] = v
+
+    if rank == 0 and len(logs):
+        wandb.log(logs, step=train_state.step)
 
 if __name__ == "__main__":
     launch()

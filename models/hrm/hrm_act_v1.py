@@ -156,6 +156,10 @@ class TopKSequenceRouter(nn.Module):
         self.num_experts = num_experts
         self.top_k = max(1, int(top_k))
         self.gate = CastedLinear(hidden_size, num_experts, bias=False)
+        # last-step observability for logging
+        self.last_load: Optional[torch.Tensor] = None  # [E]
+        self.last_counts: Optional[torch.Tensor] = None  # [E]
+        self.last_batch_size: Optional[int] = None
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # hidden_states: [B, S, H]; use position 0 summary
@@ -176,6 +180,12 @@ class TopKSequenceRouter(nn.Module):
         sel_mask.scatter_(dim=-1, index=topk_idx, src=torch.ones_like(topk_vals))
         load = sel_mask.sum(dim=0) / max(B * K, 1)
         aux_loss = (self.num_experts * (importance * load)).sum()
+
+        # Store observability for logging outside
+        self.last_load = load.detach()
+        self.last_counts = sel_mask.sum(dim=0).detach()  # selections per expert in this batch
+        self.last_batch_size = int(B)
+
         return topk_idx, topk_weights, aux_loss
 
 
@@ -211,6 +221,11 @@ class ACTV1MoERoutingLayer(nn.Module):
                 num_heads_sub=num_heads_sub
             ) for _ in range(config.H_moe_num_experts)
         ])
+        # Expose last usage for logging
+        self.last_usage_load: Optional[torch.Tensor] = None  # [E]
+        self.last_counts: Optional[torch.Tensor] = None  # [E]
+        self.last_batch_size: Optional[int] = None
+        self.last_top_k: int = int(config.H_moe_top_k)
 
     def forward(self, hidden_states: torch.Tensor, cos_sin: CosSin, input_injection: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # Input injection (add) first to match ReasoningModule
@@ -240,6 +255,12 @@ class ACTV1MoERoutingLayer(nn.Module):
 
         # Residual + norm at parent space
         out = rms_norm(hidden_states + mixed, variance_epsilon=self.norm_eps)
+
+        # Store usage observability from router
+        self.last_usage_load = None if self.router.last_load is None else self.router.last_load.detach()
+        self.last_counts = None if self.router.last_counts is None else self.router.last_counts.detach()
+        self.last_batch_size = self.router.last_batch_size
+
         return out, aux_loss
 
 
@@ -249,17 +270,24 @@ class HierarchicalReasoningModel_ACTV1MoEReasoningModule(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([ACTV1MoERoutingLayer(config) for _ in range(config.H_layers)])
         self.last_aux_loss: Optional[torch.Tensor] = None
+        self.last_usage_per_layer: Optional[List[torch.Tensor]] = None
 
     def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
         cos_sin = kwargs.get("cos_sin", None)
         total_aux = None
+        usage_list: List[torch.Tensor] = []
         for layer in self.layers:
             hidden_states, aux = layer(hidden_states=hidden_states, cos_sin=cos_sin, input_injection=input_injection)
             total_aux = aux if total_aux is None else (total_aux + aux)
+            if layer.last_usage_load is not None:
+                usage_list.append(layer.last_usage_load)
+            else:
+                usage_list.append(torch.zeros((len(layer.experts),), device=hidden_states.device, dtype=torch.float32))
         # Store for retrieval by caller (normalize by number of layers for stability)
         if total_aux is not None and len(self.layers) > 0:
             total_aux = total_aux / len(self.layers)
         self.last_aux_loss = total_aux
+        self.last_usage_per_layer = usage_list
         return hidden_states
 
 
@@ -447,7 +475,7 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
                 
                 outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-        # Attach MoE aux loss if present (only H-level MoE produces it)
+        # Attach MoE aux loss and usage if present (only H-level MoE produces it)
         if getattr(self.inner, "H_level", None) is not None and hasattr(self.inner.H_level, "last_aux_loss"):
             aux = self.inner.H_level.last_aux_loss
             if aux is not None:
