@@ -30,7 +30,7 @@ module load cuda/11.8
 # Activate pre-existing environment.
 conda activate pytorch
 
-git pull
+#git pull
 
 # Get a unique port for this job based on the job ID
 export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))

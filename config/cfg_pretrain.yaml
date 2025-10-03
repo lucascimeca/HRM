@@ -32,7 +32,7 @@ puzzle_emb_lr: 1e-2
 use_H_moe: True
 
 # MoE (Mixture-of-Experts)
-H_moe_num_experts: 50
-H_moe_top_k: 20
-H_moe_hidden_ratio:  0.01
+H_moe_num_experts: 25
+H_moe_top_k: 8
+H_moe_hidden_ratio:  0.1
 H_moe_aux_loss_weight: 0.01
