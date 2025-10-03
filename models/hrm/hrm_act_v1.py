@@ -454,3 +454,4 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
                 outputs["moe_aux_loss"] = aux  # keep grad so loss head can optimize router
 
         return HierarchicalReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+

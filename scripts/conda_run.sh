@@ -9,6 +9,7 @@
 #SBATCH --output=%x_%j.out
 
 # or > salloc --gres=gpu:1 --constraint="80gb" --cpus-per-task=6 --mem=32G  --time=12:00:00 --nodes=1 --partition=main
+cd "${SLURM_SUBMIT_DIR:-$HOME}"  # fallback to $HOME if unset
 
 # Compute the output directory after the SBATCH directives
 export OUTPUT_DIR=$HOME/script_outputs
@@ -42,11 +43,6 @@ set -euo pipefail
 # optional: echo commands as they run
 # set -x
 
-# Determine repo root and cd there so relative paths work regardless of submission dir
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-REPO_ROOT="${SCRIPT_DIR}/.."
-cd "${REPO_ROOT}"
-
 # 4) determine local world size = # GPUs on this node
 #    Prefer Slurm's view; fallback to nvidia-smi count if unset.
 GPUS_PER_NODE="${SLURM_GPUS_ON_NODE:-}"
@@ -60,20 +56,21 @@ if ! [[ "$GPUS_PER_NODE" =~ ^[0-9]+$ ]] || [[ "$GPUS_PER_NODE" -lt 1 ]]; then
 fi
 
 echo "GPUS_PER_NODE=${GPUS_PER_NODE}"
+# Pick a writable place
+SHIM_BASE="${SLURM_TMPDIR:-$PWD}"
+SHIM_DIR="${SHIM_BASE}/libcuda_shim"
+mkdir -p "$SHIM_DIR"
 
-# inside your job, before launching torchrun
-mkdir -p "$PWD/libcuda_shim"
-
-# prefer a real, existing .so.1
+# Link a real libcuda if present
 if [ -f /usr/local/cuda/compat/lib/libcuda.so.1 ]; then
-  ln -sf /usr/local/cuda/compat/lib/libcuda.so.1 "$PWD/libcuda_shim/libcuda.so.1"
-  ln -sf /usr/local/cuda/compat/lib/libcuda.so.1 "$PWD/libcuda_shim/libcuda.so"
+  ln -sf /usr/local/cuda/compat/lib/libcuda.so.1 "$SHIM_DIR/libcuda.so.1"
+  ln -sf /usr/local/cuda/compat/lib/libcuda.so"
 elif [ -f /lib/x86_64-linux-gnu/libcuda.so.1 ]; then
-  ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 "$PWD/libcuda_shim/libcuda.so.1"
-  ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 "$PWD/libcuda_shim/libcuda.so"
+  ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 "$SHIM_DIR/libcuda.so.1"
+  ln -sf /lib/x86_64-linux-gnu/libcuda.so"
 fi
 
-export LD_LIBRARY_PATH="$PWD/libcuda_shim:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$SHIM_DIR:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 
 # Default overrides (can be overridden by passing hydra args to this script)
 DEFAULT_OVERRIDES=(
