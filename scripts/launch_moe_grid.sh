@@ -10,8 +10,9 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 JOB_SCRIPT="${SCRIPT_DIR}/conda_run.sh"
 
-if [[ ! -x "$JOB_SCRIPT" ]]; then
-  echo "ERROR: $JOB_SCRIPT not found or not executable" >&2
+# Only require the script file to exist; sbatch doesn't need it to be executable
+if [[ ! -f "$JOB_SCRIPT" ]]; then
+  echo "ERROR: $JOB_SCRIPT not found" >&2
   exit 1
 fi
 
@@ -59,4 +60,3 @@ for exp in "${EXPERIMENTS[@]}"; do
 done
 
 echo "All jobs submitted. Use 'squeue -u $USER' to monitor."
-
