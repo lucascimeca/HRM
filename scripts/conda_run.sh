@@ -2,7 +2,6 @@
 #SBATCH --job-name=hrm_ddp
 #SBATCH --constraint="80gb"
 #SBATCH --gres=gpu:2
-#SBATCH --partition=main
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=42G
 #SBATCH --time=24:00:00
