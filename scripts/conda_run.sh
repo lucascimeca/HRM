@@ -88,6 +88,6 @@ DEFAULT_OVERRIDES=(
 EXTRA_OVERRIDES=("$@")
 
 # Launch
-torchrun --nproc_per_node=${GPUS_PER_NODE} pretrain.py \
+torchrun --nproc_per_node=${GPUS_PER_NODE} ${SLURM_SUBMIT_DIR}/../pretrain.py \
     "${DEFAULT_OVERRIDES[@]}" \
     "${EXTRA_OVERRIDES[@]}"
