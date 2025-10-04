@@ -54,7 +54,7 @@ for exp in "${EXPERIMENTS[@]}"; do
   echo "Submitting: ${run_name} :: ${overrides}"
 
   # Forward a deterministic run_name so runs are labeled by config
-  sbatch "$JOB_SCRIPT" run_name="$run_name" $overrides
+  sbatch "$JOB_SCRIPT" --run_name="$run_name" $overrides
   # Add a tiny sleep to avoid hammering the scheduler
   sleep 0.5
 done
