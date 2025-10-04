@@ -7,6 +7,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --output=%x_%j.out
+#SBATCH --partition=main
 
 # or > salloc --gres=gpu:1 --constraint="80gb" --cpus-per-task=6 --mem=32G  --time=12:00:00 --nodes=1 --partition=main
 

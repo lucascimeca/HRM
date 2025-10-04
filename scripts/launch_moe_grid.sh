@@ -32,19 +32,19 @@ declare -a EXPERIMENTS=(
   # Balanced parity (E=64, K=4, r=0.42, aux=0.01)
   "E64_K4_r0.42_aux0.01 use_H_moe=True H_moe_num_experts=64 H_moe_top_k=4 H_moe_hidden_ratio=0.42 H_moe_aux_loss_weight=0.01"
   # More smaller experts (parity)
-  "E128_K8_r0.28_aux0.01 use_H_moe=True H_moe_num_experts=128 H_moe_top_k=8 H_moe_hidden_ratio=0.28 H_moe_aux_loss_weight=0.01"
-  # Fewer larger experts (parity)
-  "E32_K2_r0.63_aux0.01 use_H_moe=True H_moe_num_experts=32 H_moe_top_k=2 H_moe_hidden_ratio=0.63 H_moe_aux_loss_weight=0.01"
-  # Under-parity variants (~80% of parity r)
-  "E64_K4_r0.33_aux0.01 use_H_moe=True H_moe_num_experts=64 H_moe_top_k=4 H_moe_hidden_ratio=0.33 H_moe_aux_loss_weight=0.01"
-  "E32_K2_r0.50_aux0.01 use_H_moe=True H_moe_num_experts=32 H_moe_top_k=2 H_moe_hidden_ratio=0.50 H_moe_aux_loss_weight=0.01"
-  "E128_K8_r0.22_aux0.01 use_H_moe=True H_moe_num_experts=128 H_moe_top_k=8 H_moe_hidden_ratio=0.22 H_moe_aux_loss_weight=0.01"
-  # Aux load balancing ablations (around parity)
-  "E64_K4_r0.42_aux0.00 use_H_moe=True H_moe_num_experts=64 H_moe_top_k=4 H_moe_hidden_ratio=0.42 H_moe_aux_loss_weight=0.0"
-  "E64_K4_r0.42_aux0.001 use_H_moe=True H_moe_num_experts=64 H_moe_top_k=4 H_moe_hidden_ratio=0.42 H_moe_aux_loss_weight=0.001"
-  "E64_K4_r0.42_aux0.05 use_H_moe=True H_moe_num_experts=64 H_moe_top_k=4 H_moe_hidden_ratio=0.42 H_moe_aux_loss_weight=0.05"
-  # Extreme under-parameterized (your example)
-  "E50_K20_r0.01_aux0.01 use_H_moe=True H_moe_num_experts=50 H_moe_top_k=20 H_moe_hidden_ratio=0.01 H_moe_aux_loss_weight=0.01"
+#  "E128_K8_r0.28_aux0.01 use_H_moe=True H_moe_num_experts=128 H_moe_top_k=8 H_moe_hidden_ratio=0.28 H_moe_aux_loss_weight=0.01"
+#  # Fewer larger experts (parity)
+#  "E32_K2_r0.63_aux0.01 use_H_moe=True H_moe_num_experts=32 H_moe_top_k=2 H_moe_hidden_ratio=0.63 H_moe_aux_loss_weight=0.01"
+#  # Under-parity variants (~80% of parity r)
+#  "E64_K4_r0.33_aux0.01 use_H_moe=True H_moe_num_experts=64 H_moe_top_k=4 H_moe_hidden_ratio=0.33 H_moe_aux_loss_weight=0.01"
+#  "E32_K2_r0.50_aux0.01 use_H_moe=True H_moe_num_experts=32 H_moe_top_k=2 H_moe_hidden_ratio=0.50 H_moe_aux_loss_weight=0.01"
+#  "E128_K8_r0.22_aux0.01 use_H_moe=True H_moe_num_experts=128 H_moe_top_k=8 H_moe_hidden_ratio=0.22 H_moe_aux_loss_weight=0.01"
+#  # Aux load balancing ablations (around parity)
+#  "E64_K4_r0.42_aux0.00 use_H_moe=True H_moe_num_experts=64 H_moe_top_k=4 H_moe_hidden_ratio=0.42 H_moe_aux_loss_weight=0.0"
+#  "E64_K4_r0.42_aux0.001 use_H_moe=True H_moe_num_experts=64 H_moe_top_k=4 H_moe_hidden_ratio=0.42 H_moe_aux_loss_weight=0.001"
+#  "E64_K4_r0.42_aux0.05 use_H_moe=True H_moe_num_experts=64 H_moe_top_k=4 H_moe_hidden_ratio=0.42 H_moe_aux_loss_weight=0.05"
+#  # Extreme under-parameterized (your example)
+#  "E50_K20_r0.01_aux0.01 use_H_moe=True H_moe_num_experts=50 H_moe_top_k=20 H_moe_hidden_ratio=0.01 H_moe_aux_loss_weight=0.01"
 )
 
 for exp in "${EXPERIMENTS[@]}"; do
