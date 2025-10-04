@@ -583,11 +583,12 @@ def launch(hydra_config: DictConfig):
         for set_name, batch, global_batch_size in train_loader:
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
+            # All ranks must participate in MoE usage aggregation collectives
+            _log_moe_usage_histograms(train_state, WORLD_SIZE, RANK)
+
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
-                # Log MoE usage histograms (if available)
-                _log_moe_usage_histograms(train_state, WORLD_SIZE, RANK)
 
         ############ Evaluation
         train_state.model.eval()
@@ -609,41 +610,51 @@ def launch(hydra_config: DictConfig):
 def _log_moe_usage_histograms(train_state: TrainState, world_size: int, rank: int):
     """Aggregate per-expert usage across ranks and log per-layer histograms to Weights & Biases.
 
-    For each H-level MoE layer, we expect attributes on the routing layer:
-      - last_counts: Tensor[E] with number of selections per expert in the last batch
-      - last_batch_size: int B for that batch
-      - last_top_k: int top_k used by the router
-    We compute global selection rate = total_counts / (sum_ranks B*top_k) and log as a bar plot.
+    For each H-level MoE layer, we perform identical collectives on all ranks to avoid NCCL mismatches.
+    If a layer is MoE (has `experts`), but this rank doesn't have `last_counts` populated yet, we all-reduce
+    zeros of the appropriate shape so every rank issues the same collectives per layer.
     """
     try:
         base_model = getattr(train_state.model, "model", None)
         inner = getattr(base_model, "inner", None)
         H_level = getattr(inner, "H_level", None)
         layers = getattr(H_level, "layers", None)
+        cfg = getattr(base_model, "config", None)
     except Exception:
         return
-    if layers is None:
+    if layers is None or cfg is None:
         return
+
+    # Fallbacks for consistent shapes across ranks
+    local_B = int(getattr(cfg, "batch_size", 1))
+    top_k = int(getattr(cfg, "H_moe_top_k", 0))
 
     logs = {}
     for li, layer in enumerate(layers):
-        counts = getattr(layer, "last_counts", None)
-        B = getattr(layer, "last_batch_size", None)
-        top_k = getattr(layer, "last_top_k", None)
-        if counts is None or B is None or top_k is None or B == 0 or top_k == 0:
+        # Only consider MoE layers (routing layers have `experts`)
+        experts = getattr(layer, "experts", None)
+        if experts is None:
+            continue
+        E = len(experts)
+        if E == 0:
             continue
 
+        # Gather last usage if available; otherwise create zeros so every rank participates
+        counts = getattr(layer, "last_counts", None)
         # Choose a device suitable for collectives
-        if counts.is_cuda:
-            device = counts.device
-        elif torch.cuda.is_available():
-            device = torch.device("cuda")
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+        if counts is not None:
+            counts_t = counts.to(device=device, dtype=torch.float32).clone()
+            B_eff = int(getattr(layer, "last_batch_size", local_B))
+            K_eff = int(getattr(layer, "last_top_k", top_k))
         else:
-            device = torch.device("cpu")
+            counts_t = torch.zeros((E,), device=device, dtype=torch.float32)
+            B_eff = local_B
+            K_eff = top_k
+        denom_t = torch.tensor([float(max(B_eff, 0) * max(K_eff, 0))], device=device, dtype=torch.float32)
 
-        counts_t = counts.to(device=device, dtype=torch.float32).clone()
-        denom_t = torch.tensor([float(B * top_k)], device=device, dtype=torch.float32)
-
+        # All ranks must participate with identical collectives for this MoE layer
         if world_size > 1 and dist.is_initialized():
             dist.all_reduce(counts_t, op=dist.ReduceOp.SUM)
             dist.all_reduce(denom_t, op=dist.ReduceOp.SUM)
@@ -668,5 +679,3 @@ def _log_moe_usage_histograms(train_state: TrainState, world_size: int, rank: in
     if rank == 0 and len(logs):
         wandb.log(logs, step=train_state.step)
 
-if __name__ == "__main__":
-    launch()
