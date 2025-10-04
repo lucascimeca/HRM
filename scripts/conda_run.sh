@@ -12,7 +12,7 @@
 # or > salloc --gres=gpu:1 --constraint="80gb" --cpus-per-task=6 --mem=32G  --time=12:00:00 --nodes=1 --partition=main
 
 # Compute the output directory after the SBATCH directives
-export OUTPUT_DIR=$HOME/script_outputs
+#export OUTPUT_DIR=$HOME/script_outputs
 # Update the output path of the SLURM output file
 #export SLURM_JOB_OUTPUT=${OUTPUT_DIR}/$(basename ${SLURM_JOB_OUTPUT})
 
