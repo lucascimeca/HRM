@@ -14,7 +14,7 @@
 # Compute the output directory after the SBATCH directives
 export OUTPUT_DIR=$HOME/script_outputs
 # Update the output path of the SLURM output file
-export SLURM_JOB_OUTPUT=${OUTPUT_DIR}/$(basename ${SLURM_JOB_OUTPUT})
+#export SLURM_JOB_OUTPUT=${OUTPUT_DIR}/$(basename ${SLURM_JOB_OUTPUT})
 
 # Echo time and hostname into log
 echo "Date:     $(date)"
