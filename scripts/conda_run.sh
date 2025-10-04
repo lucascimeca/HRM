@@ -9,42 +9,44 @@
 #SBATCH --output=%x_%j.out
 
 # or > salloc --gres=gpu:1 --constraint="80gb" --cpus-per-task=6 --mem=32G  --time=12:00:00 --nodes=1 --partition=main
-cd "${SLURM_SUBMIT_DIR:-$HOME}"  # fallback to $HOME if unset
-
-# Compute the output directory after the SBATCH directives
-export OUTPUT_DIR=$HOME/script_outputs
-# Update the output path of the SLURM output file
-export SLURM_JOB_OUTPUT=${OUTPUT_DIR}/$(basename ${SLURM_JOB_OUTPUT})
-
-# Echo time and hostname into log
-echo "Date:     $(date)"
-echo "Hostname: $(hostname)"
-
-# Ensure only anaconda/3 module loaded.
-module --quiet purge
-# This example uses Conda to manage package dependencies.
-# See https://docs.mila.quebec/Userguide.html#conda for more information.
-module load anaconda/3
-module load cuda/11.8
-
-# Activate pre-existing environment.
-conda activate pytorch
-
-#git pull
-
-# Get a unique port for this job based on the job ID
-export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
-export MASTER_ADDR="127.0.0.1"
-
-# Fixes issues with MIG-ed GPUs with versions of PyTorch < 2.0
-unset CUDA_VISIBLE_DEVICES
 
 set -euo pipefail
 # optional: echo commands as they run
 # set -x
 
-# 4) determine local world size = # GPUs on this node
-#    Prefer Slurm's view; fallback to nvidia-smi count if unset.
+# Resolve repository root relative to this script's location
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+REPO_ROOT="${SCRIPT_DIR}/.."
+
+# Ensure we run from the repo root for relative paths (e.g., checkpoints/)
+cd "$REPO_ROOT"
+
+# Echo time and hostname into log
+echo "Date:     $(date)"
+echo "Hostname: $(hostname)"
+
+echo "Working directory: $(pwd)"
+
+# Ensure only anaconda/3 module loaded.
+module --quiet purge || true
+# This example uses Conda to manage package dependencies.
+module load anaconda/3 || true
+module load cuda/11.8 || true
+
+# Activate pre-existing environment.
+conda activate pytorch
+
+# Prefer pure PyTorch AdamAtan2 implementation to avoid CUDA extension incompatibilities on clusters
+export FORCE_PY_ADAM_ATAN2=1
+
+# Get a unique port for this job based on the job ID
+export MASTER_PORT=$(expr 10000 + $(echo -n ${SLURM_JOBID:-$$} | tail -c 4))
+export MASTER_ADDR="127.0.0.1"
+
+# Fixes issues with MIG-ed GPUs with versions of PyTorch < 2.0
+unset CUDA_VISIBLE_DEVICES || true
+
+# Determine local world size = # GPUs on this node
 GPUS_PER_NODE="${SLURM_GPUS_ON_NODE:-}"
 if [[ -z "$GPUS_PER_NODE" ]]; then
   GPUS_PER_NODE="$(nvidia-smi -L | wc -l | tr -d ' ')"
@@ -61,13 +63,13 @@ SHIM_BASE="${SLURM_TMPDIR:-$PWD}"
 SHIM_DIR="${SHIM_BASE}/libcuda_shim"
 mkdir -p "$SHIM_DIR"
 
-# Link a real libcuda if present
+# Link a real libcuda if present (workaround for library path issues on some clusters)
 if [ -f /usr/local/cuda/compat/lib/libcuda.so.1 ]; then
   ln -sf /usr/local/cuda/compat/lib/libcuda.so.1 "$SHIM_DIR/libcuda.so.1"
-  ln -sf /usr/local/cuda/compat/lib/libcuda.so"
+  ln -sf /usr/local/cuda/compat/lib/libcuda.so "$SHIM_DIR/libcuda.so"
 elif [ -f /lib/x86_64-linux-gnu/libcuda.so.1 ]; then
   ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 "$SHIM_DIR/libcuda.so.1"
-  ln -sf /lib/x86_64-linux-gnu/libcuda.so"
+  ln -sf /lib/x86_64-linux-gnu/libcuda.so "$SHIM_DIR/libcuda.so"
 fi
 
 export LD_LIBRARY_PATH="$SHIM_DIR:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
@@ -88,6 +90,6 @@ DEFAULT_OVERRIDES=(
 EXTRA_OVERRIDES=("$@")
 
 # Launch
-torchrun --nproc_per_node=${GPUS_PER_NODE} ${SLURM_SUBMIT_DIR}/../pretrain.py \
+exec torchrun --nproc_per_node=${GPUS_PER_NODE} pretrain.py \
     "${DEFAULT_OVERRIDES[@]}" \
     "${EXTRA_OVERRIDES[@]}"
