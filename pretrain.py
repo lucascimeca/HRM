@@ -19,15 +19,12 @@ from omegaconf import DictConfig
 
 
 try:
-    # Allow forcing the pure-PyTorch version via env to avoid CUDA extension issues
-    if os.getenv("FORCE_PY_ADAM_ATAN2", "0") == "1":
-        raise ImportError("FORCE_PY_ADAM_ATAN2=1")
     from adam_atan2 import AdamATan2
 except ImportError:
     try:
         from adam_atan2_pytorch import AdamAtan2 as AdamATan2
     except ImportError:
-        raise ImportError("Please install the adam-atan2 package or set FORCE_PY_ADAM_ATAN2=1 to use the pure PyTorch fallback")
+        raise ImportError("Please install the adam-atan2 package")
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
@@ -586,12 +583,11 @@ def launch(hydra_config: DictConfig):
         for set_name, batch, global_batch_size in train_loader:
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
-            # Always call the MoE usage aggregator on all ranks to avoid collective mismatches
-            _log_moe_usage_histograms(train_state, WORLD_SIZE, RANK)
-
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                # Log MoE usage histograms (if available)
+                _log_moe_usage_histograms(train_state, WORLD_SIZE, RANK)
 
         ############ Evaluation
         train_state.model.eval()
@@ -671,3 +667,6 @@ def _log_moe_usage_histograms(train_state: TrainState, world_size: int, rank: in
 
     if rank == 0 and len(logs):
         wandb.log(logs, step=train_state.step)
+
+if __name__ == "__main__":
+    launch()
