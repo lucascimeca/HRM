@@ -5,7 +5,7 @@
 # Each line below launches one job via scripts/conda_run.sh with MoE overrides.
 
 # Balanced parity (E=64, K=4, r=0.42, aux=0.01)
-sbatch scripts/conda_run.sh use_H_moe=True H_moe_num_experts=64 H_moe_top_k=4 H_moe_hidden_ratio=0.42 H_moe_aux_loss_weight=0.01
+sbatch conda_run.sh use_H_moe=True H_moe_num_experts=64 H_moe_top_k=4 H_moe_hidden_ratio=0.42 H_moe_aux_loss_weight=0.01
 
 # More smaller experts (parity)
 #sbatch scripts/conda_run.sh use_H_moe=True H_moe_num_experts=128 H_moe_top_k=8 H_moe_hidden_ratio=0.28 H_moe_aux_loss_weight=0.01
