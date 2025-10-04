@@ -679,3 +679,5 @@ def _log_moe_usage_histograms(train_state: TrainState, world_size: int, rank: in
     if rank == 0 and len(logs):
         wandb.log(logs, step=train_state.step)
 
+if __name__ == "__main__":
+    launch()
