@@ -670,18 +670,16 @@ def _log_moe_usage_histograms(train_state: TrainState, world_size: int, rank: in
         total_selects = float(denom_t.item())
         if total_selects <= 0:
             continue
-        rate = (counts_t / total_selects).cpu().numpy()
+        rate = (counts_t / total_selects).detach().cpu().tolist()
 
-        # Prefer a bar plot; fall back to scalar logs if plotting fails
-        try:
-            table = wandb.Table(data=[[int(i), float(rate[i])] for i in range(len(rate))], columns=["expert", "rate"])
-            logs[f"moe/usage_layer_{li}"] = wandb.plot.bar(table, "expert", "rate", title=f"MoE Usage Layer {li}")
-        except Exception:
-            for i, v in enumerate(rate.tolist()):
-                logs[f"moe/usage_layer_{li}/expert_{i}"] = v
+        # Log as plain scalars (avoids W&B artifact tables and quotas)
+        for i, v in enumerate(rate):
+            logs[f"moe/usage_layer_{li}/expert_{i}"] = float(v)
 
     if rank == 0 and len(logs):
-        wandb.log(logs, step=train_state.step)
+        try:
+            wandb.log(logs, step=train_state.step)
+        except Exception as e:
+            # Non-fatal: skip MoE usage logging if W&B storage is constrained
+            print(f"[W&B] Skipping MoE usage logging due to error: {e}")
 
-if __name__ == "__main__":
-    launch()
