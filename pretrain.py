@@ -683,3 +683,5 @@ def _log_moe_usage_histograms(train_state: TrainState, world_size: int, rank: in
             # Non-fatal: skip MoE usage logging if W&B storage is constrained
             print(f"[W&B] Skipping MoE usage logging due to error: {e}")
 
+if __name__ == "__main__":
+    launch()
