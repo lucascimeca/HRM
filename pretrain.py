@@ -469,8 +469,12 @@ def save_code_and_config(config: PretrainConfig):
     with open(config_file, "wt") as f:
         yaml.dump(config.model_dump(), f)
 
-    # Log code
-    wandb.run.log_code(config.checkpoint_path)
+    # Log code — guard to avoid aborting training when storage is full on cluster
+    try:
+        wandb.run.log_code(config.checkpoint_path)
+    except Exception as e:
+        # Non-fatal: continue training if code logging fails (e.g., disk quota exceeded)
+        print(f"[W&B] Skipping code logging due to error: {e}")
 
 
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> PretrainConfig:
@@ -580,17 +584,15 @@ def launch(hydra_config: DictConfig):
 
         ############ Train Iter
         train_state.model.train()
-        i = 0
         for set_name, batch, global_batch_size in train_loader:
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             # All ranks must participate in MoE usage aggregation collectives
             _log_moe_usage_histograms(train_state, WORLD_SIZE, RANK)
 
-            if RANK == 0 and metrics is not None and i % 10 == 0:
+            if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
-            i += 1
 
         ############ Evaluation
         train_state.model.eval()
