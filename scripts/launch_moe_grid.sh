@@ -7,7 +7,6 @@
 # Notation:
 # - H_moe_hidden_ratio scales each expert's FFN expansion vs. dense baseline.
 #   Rough rule: active FFN compute per MoE block ≈ top_k * H_moe_hidden_ratio of dense.
-# - Choose more experts and bigger top_k for smaller experts; choose fewer experts and k=1 for larger experts.
 
 # Resolve conda_run.sh relative to this script's directory for robustness
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
