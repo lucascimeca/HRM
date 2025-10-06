@@ -13,6 +13,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUN_SH="${SCRIPT_DIR}/conda_run.sh"
 SBATCH_CHDIR=(--chdir "$SCRIPT_DIR")
 
+sbatch "${SBATCH_CHDIR[@]}" "$RUN_SH" use_H_moe=False H_moe_num_experts=1  H_moe_top_k=1 H_moe_hidden_ratio=1.0 H_moe_aux_loss_weight=0.01
+
 # --- Small experts (ratio ~ 0.25) -> pick many ---
 # Parity around k≈4 (0.25*4 ≈ 1x), explore more/less k and E
 sbatch "${SBATCH_CHDIR[@]}" "$RUN_SH" use_H_moe=True H_moe_num_experts=128 H_moe_top_k=8 H_moe_hidden_ratio=0.25 H_moe_aux_loss_weight=0.01

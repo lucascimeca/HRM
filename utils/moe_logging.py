@@ -6,13 +6,22 @@ import torch
 import torch.distributed as dist
 import wandb
 
+# Optional matplotlib for labeled heatmap with colorbar; fall back gracefully if unavailable
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # headless-safe
+    import matplotlib.pyplot as plt
+    _HAS_MPL = True
+except Exception:
+    _HAS_MPL = False
+
 
 class MoEUsageLogger:
     """
     Low-bandwidth MoE usage logger:
       - Per-layer scalars: neff_frac, entropy01, gini, cv, max_share, topk_share
       - Optional fixed-bin histogram (no raw samples uploaded)
-      - Single compact heatmap image (layers x maxE), 8-bit
+      - Heatmap (layers x maxE) with labels and colorbar when matplotlib is available; compact image fallback otherwise
     """
     def __init__(
         self,
@@ -27,6 +36,7 @@ class MoEUsageLogger:
     ):
         self.E = list(experts_per_layer)
         self.L = len(self.E)
+        self.maxE = max(self.E) if self.E else 0
         self.beta = float(ema_beta)
         self.topk_share_k = int(topk_share_k)
         self.log_every = int(log_every)
@@ -35,16 +45,64 @@ class MoEUsageLogger:
         self.gamma = float(image_gamma)
         self.prefix = name_prefix
         self.step = 0
+        self.layer_labels = [f"H{idx+1}" for idx in range(self.L)]
+        self.expert_labels = [f"E{j}" for j in range(self.maxE)]
         self.ema_counts = [torch.zeros(e, dtype=torch.float32) for e in self.E]
         if self.make_hist:
             self.bin_edges = np.linspace(0.0, 1.0, self.hist_bins + 1, dtype=np.float32)
 
     @staticmethod
     def _allreduce_sum_(t: torch.Tensor) -> None:
-        if dist.is_available() and dist.is_initialized():
-            if t.dtype != torch.float32:
-                t = t.to(torch.float32)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        """All-reduce sum into-place on tensor t regardless of backend/device.
+        - If backend is NCCL, reduce on current CUDA device then copy back to t's device.
+        - Else (e.g., Gloo), reduce directly on t (CPU tensors supported).
+        """
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+
+        # Determine backend robustly
+        backend = None
+        try:
+            backend = dist.get_backend()
+        except Exception:
+            backend = None
+
+        # Ensure we have a float32 buffer to reduce
+        original_dtype = t.dtype
+        src = t if t.dtype == torch.float32 else t.to(torch.float32)
+
+        def _copy_back(src_reduced: torch.Tensor) -> None:
+            # Copy reduced values back into original tensor on its original device/dtype
+            if src_reduced.device != t.device or src_reduced.dtype != original_dtype:
+                t.copy_(src_reduced.to(device=t.device, dtype=original_dtype))
+            else:
+                # Same storage: if src is t, reduction already updated t in-place
+                if src_reduced.data_ptr() != t.data_ptr():
+                    t.copy_(src_reduced)
+
+        # Handle NCCL (GPU-only) vs others (e.g., Gloo CPU)
+        is_nccl = False
+        try:
+            # dist.Backend.NCCL is an Enum in recent PyTorch; compare both styles for safety
+            is_nccl = (backend == dist.Backend.NCCL) or (str(backend).lower() == "nccl")
+        except Exception:
+            is_nccl = str(backend).lower() == "nccl"
+
+        if is_nccl:
+            # Move to current CUDA device for reduction, then bring back
+            if not torch.cuda.is_available():
+                # Fallback: attempt CPU all_reduce (will fail for NCCL, but keeps behavior explicit)
+                dist.all_reduce(src, op=dist.ReduceOp.SUM)
+                _copy_back(src)
+                return
+            cuda_dev = torch.device("cuda", torch.cuda.current_device())
+            tmp = src if src.device.type == "cuda" else src.to(cuda_dev, non_blocking=True)
+            dist.all_reduce(tmp, op=dist.ReduceOp.SUM)
+            _copy_back(tmp)
+        else:
+            # Gloo path: CPU tensors supported directly
+            dist.all_reduce(src, op=dist.ReduceOp.SUM)
+            _copy_back(src)
 
     @staticmethod
     def _norm_counts(counts: torch.Tensor) -> torch.Tensor:
@@ -90,6 +148,60 @@ class MoEUsageLogger:
     def _topk_share(p: torch.Tensor, k: int) -> float:
         k = max(1, min(k, p.numel()))
         return float(torch.topk(p, k).values.sum().item())
+
+    def _build_heatmap_matrix(self) -> np.ndarray:
+        """Build L x maxE array of usage probabilities; pads with zeros for layers with fewer experts."""
+        H = np.zeros((self.L, self.maxE), dtype=np.float32)
+        for l in range(self.L):
+            e = self.E[l]
+            p = self._norm_counts(self.ema_counts[l]).clamp_min(0).cpu().numpy()
+            H[l, :e] = p
+        # Optional gamma correction for visual contrast
+        if self.gamma != 1.0 and self.gamma > 0.0:
+            H = np.power(H, self.gamma, dtype=np.float32)
+            vmax = H.max()
+            if vmax > 0:
+                H = H / vmax
+        return H
+
+    def _log_heatmap(self, step: int) -> None:
+        if self.L == 0 or self.maxE == 0:
+            return
+        H = self._build_heatmap_matrix()
+        if _HAS_MPL:
+            # Size heuristics to keep readability for larger matrices
+            fig_h = max(2.2, 0.35 * self.L + 1.0)
+            fig_w = max(3.0, 0.5 * self.maxE + 1.2)
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
+            im = ax.imshow(H, interpolation="nearest", aspect="auto", cmap="magma", vmin=0.0, vmax=1.0)
+            ax.set_xlabel("Expert")
+            ax.set_ylabel("Layer (H-level)")
+            # Manage tick density for readability
+            if self.maxE <= 30:
+                ax.set_xticks(range(self.maxE))
+                ax.set_xticklabels(self.expert_labels, fontsize=8)
+            else:
+                step_x = 5 if self.maxE <= 80 else 10
+                xs = list(range(0, self.maxE, step_x))
+                ax.set_xticks(xs)
+                ax.set_xticklabels([f"E{x}" for x in xs], fontsize=8)
+            ax.set_yticks(range(self.L))
+            ax.set_yticklabels(self.layer_labels, fontsize=8)
+            # Faint separators where layers have fewer experts than maxE
+            for li, e in enumerate(self.E):
+                if e < self.maxE:
+                    ax.plot([e - 0.5, e - 0.5], [li - 0.5, li + 0.5], color="w", alpha=0.25, linewidth=0.6)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("share", rotation=270, labelpad=8)
+            ax.set_title("MoE expert usage (per layer)")
+            try:
+                wandb.log({f"{self.prefix}/usage_heatmap": wandb.Image(fig)}, step=step)
+            finally:
+                plt.close(fig)
+        else:
+            # Fallback: compact unlabeled image
+            img_u8 = (H * 255.0 + 0.5).astype(np.uint8)
+            wandb.log({f"{self.prefix}/usage_heatmap": wandb.Image(img_u8, caption=f"MoE usage (rows=layers, cols=experts) @ {step}")}, step=step)
 
     def update(
         self,
@@ -141,26 +253,16 @@ class MoEUsageLogger:
             counts, edges = np.histogram(flat, bins=np.linspace(0.0, 1.0, self.hist_bins + 1, dtype=np.float32))
             logs[f"{self.prefix}/usage_hist"] = wandb.Histogram(np_histogram=(counts, edges))
 
-        # Single compact heatmap (L x maxE), uint8
-        maxE = max(self.E) if self.E else 0
-        if maxE > 0:
-            img = np.zeros((self.L, maxE), dtype=np.float32)
-            for l in range(self.L):
-                p = self._norm_counts(self.ema_counts[l]).numpy()
-                img[l, : self.E[l]] = p
-            img = np.power(img, self.gamma, dtype=np.float32)
-            vmax = img.max()
-            if vmax > 0:
-                img /= vmax
-            img_u8 = (img * 255.0 + 0.5).astype(np.uint8)
-            logs[f"{self.prefix}/usage_heatmap"] = wandb.Image(
-                img_u8, caption=f"MoE usage (rows=layers, cols=experts) @ {self.step}"
-            )
-
         try:
             wandb.log(logs, step=self.step)
         except Exception as e:
-            print(f"[W&B] Skipping MoE usage logging due to error: {e}")
+            print(f"[W&B] Skipping MoE usage metrics logging due to error: {e}")
+
+        # 4) Labeled heatmap with colorbar (or fallback image)
+        try:
+            self._log_heatmap(step=self.step)
+        except Exception as e:
+            print(f"[W&B] Skipping MoE heatmap logging due to error: {e}")
 
 
 def build_moe_usage_logger(train_state, log_every: int = 100) -> Optional[MoEUsageLogger]:
@@ -209,4 +311,3 @@ def collect_moe_counts_per_layer(train_state) -> Optional[List[torch.Tensor]]:
     if not len(counts_list):
         return None
     return counts_list
-
