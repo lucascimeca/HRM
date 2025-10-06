@@ -57,11 +57,11 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
     forward_dtype: str = "bfloat16"
 
     # Optional H-level MoE routing config (disabled by default)
-    use_H_moe: bool = False  # If true, replace H_level with MoE routing over sublayers
-    H_moe_num_experts: int = 0  # Number of experts per H-layer when MoE is enabled
-    H_moe_top_k: int = 2        # How many experts to activate per sequence
-    H_moe_hidden_ratio: Optional[float] = None  # If None, computed as ~ 1/sqrt(H_moe_top_k)
-    H_moe_aux_loss_weight: float = 0.01  # Load-balancing aux loss weight
+    use_H_moe: bool = False
+    H_moe_num_experts: int = 0
+    H_moe_top_k: int = 2
+    H_moe_hidden_ratio: Optional[float] = None  # unused in SOTA MoE, kept for config compatibility
+    H_moe_aux_loss_weight: float = 0.01
 
 
 class HierarchicalReasoningModel_ACTV1Block(nn.Module):
@@ -106,188 +106,174 @@ class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
         return hidden_states
 
 
-# --- Optional MoE routing over smaller sublayers (H-level only) ---
-class ACTV1SlimExpertBlock(nn.Module):
-    """
-    A smaller expert block that operates in a bottleneck subspace with size h_sub = num_heads_sub * parent_head_dim.
-    It reuses the parent's head_dim to stay compatible with RoPE cos/sin tensors while reducing parameter count.
-    """
-    def __init__(self, *, parent_hidden_size: int, parent_num_heads: int, parent_expansion: float, norm_eps: float, num_heads_sub: int):
-        super().__init__()
-        assert parent_hidden_size % parent_num_heads == 0
-        self.norm_eps = norm_eps
-        self.parent_hidden_size = parent_hidden_size
-        self.parent_head_dim = parent_hidden_size // parent_num_heads
-        self.num_heads_sub = max(1, int(num_heads_sub))
-        self.hidden_sub = self.num_heads_sub * self.parent_head_dim
-
-        # Bottleneck in/out projections
-        self.down_proj = CastedLinear(parent_hidden_size, self.hidden_sub, bias=False)
-        self.up_proj   = CastedLinear(self.hidden_sub, parent_hidden_size, bias=False)
-
-        # Internal transformer block at reduced dim using the parent's head_dim for RoPE compatibility
-        self.self_attn = Attention(
-            hidden_size=self.hidden_sub,
-            head_dim=self.parent_head_dim,
-            num_heads=self.num_heads_sub,
-            num_key_value_heads=self.num_heads_sub,
-            causal=False
-        )
-        self.mlp = SwiGLU(hidden_size=self.hidden_sub, expansion=parent_expansion)
-
-    def forward(self, hidden_states: torch.Tensor, cos_sin: CosSin) -> torch.Tensor:
-        # Down-project
-        h = self.down_proj(hidden_states)
-        # Internal block (residual + norms inside subspace)
-        h = rms_norm(h + self.self_attn(cos_sin=cos_sin, hidden_states=h), variance_epsilon=self.norm_eps)
-        h = rms_norm(h + self.mlp(h), variance_epsilon=self.norm_eps)
-        # Up-project back to parent space
-        out = self.up_proj(h)
-        return out  # Return the transform; the caller decides how to mix and apply residuals
-
-
-class TopKSequenceRouter(nn.Module):
-    """
-    Per-sequence router: compute expert scores from the first position embedding (index 0) and select top-k experts.
-    Returns (topk_idx, topk_weights) and an aux load-balancing loss.
-    """
+# --- SOTA-style token-level MoE in FFN (Switch-style) ---
+class TokenTopKRouter(nn.Module):
     def __init__(self, hidden_size: int, num_experts: int, top_k: int):
         super().__init__()
-        self.num_experts = num_experts
+        self.num_experts = int(num_experts)
         self.top_k = max(1, int(top_k))
         self.gate = CastedLinear(hidden_size, num_experts, bias=False)
-        # last-step observability for logging
-        self.last_load: Optional[torch.Tensor] = None  # [E]
-        self.last_counts: Optional[torch.Tensor] = None  # [E]
-        self.last_batch_size: Optional[int] = None
+        # Observability for logging
+        self.last_importance: Optional[torch.Tensor] = None  # [E]
+        self.last_load: Optional[torch.Tensor] = None        # [E]
+        self.last_counts: Optional[torch.Tensor] = None      # [E]
+        self.last_tokens: Optional[int] = None
 
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # hidden_states: [B, S, H]; use position 0 summary
-        gate_logits = self.gate(hidden_states[:, 0])  # [B, E]
-        gate_probs = F.softmax(gate_logits.to(torch.float32), dim=-1)  # [B, E]
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # x: [B, S, H]
+        B, S, H = x.shape
+        logits = self.gate(x)  # [B, S, E]
+        probs = F.softmax(logits.to(torch.float32), dim=-1)  # [B, S, E]
 
-        topk_vals, topk_idx = torch.topk(gate_probs, k=min(self.top_k, self.num_experts), dim=-1)  # [B, K], [B, K]
-        # Renormalize to sum 1 over selected experts
-        topk_weights = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        topk_vals, topk_idx = torch.topk(probs, k=min(self.top_k, self.num_experts), dim=-1)  # [B, S, K]
+        # Renormalize over selected experts
+        topk_weights = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp_min(1e-8)  # [B, S, K]
 
-        # Load-balancing aux loss (Switch-style): encourage balanced importance and load
-        B, E = gate_probs.shape
-        K = topk_idx.shape[-1]
-        # importance: sum of probabilities per expert
-        importance = gate_probs.sum(dim=0) / max(B, 1)
-        # load: fraction of times an expert is selected
-        sel_mask = torch.zeros((B, E), dtype=gate_probs.dtype, device=gate_probs.device)
+        # Aux loss (Switch): importance and load
+        E = self.num_experts
+        importance = probs.sum(dim=(0, 1)) / max(B * S, 1)
+        sel_mask = torch.zeros((B, S, E), dtype=probs.dtype, device=probs.device)
         sel_mask.scatter_(dim=-1, index=topk_idx, src=torch.ones_like(topk_vals))
-        load = sel_mask.sum(dim=0) / max(B * K, 1)
-        aux_loss = (self.num_experts * (importance * load)).sum()
+        load = sel_mask.sum(dim=(0, 1)) / max(B * S * topk_idx.shape[-1], 1)
+        aux_loss = (E * (importance * load)).sum()
 
-        # Store observability for logging outside
+        # Log state
+        self.last_importance = importance.detach()
         self.last_load = load.detach()
-        self.last_counts = sel_mask.sum(dim=0).detach()  # selections per expert in this batch
-        self.last_batch_size = int(B)
+        self.last_counts = sel_mask.sum(dim=(0, 1)).detach()
+        self.last_tokens = int(B * S)
 
         return topk_idx, topk_weights, aux_loss
 
 
-class ACTV1MoERoutingLayer(nn.Module):
-    """
-    A routing layer that mixes multiple slim expert blocks.
-    Each forward computes a weighted mixture of expert transforms and applies a residual update with RMS norm.
-    """
-    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config):
+class MoEMLP(nn.Module):
+    def __init__(self, hidden_size: int, expansion: float, num_experts: int, top_k: int, norm_eps: float):
         super().__init__()
-        assert config.H_moe_num_experts > 0
-        parent_hidden = config.hidden_size
-        parent_heads = config.num_heads
+        self.router = TokenTopKRouter(hidden_size, num_experts, top_k)
+        # Experts are standard SwiGLU FFNs at the same hidden size (no adapters)
+        self.experts = nn.ModuleList([SwiGLU(hidden_size=hidden_size, expansion=expansion) for _ in range(num_experts)])
+        self.norm_eps = norm_eps
+        # Expose last usage
+        self.last_load: Optional[torch.Tensor] = None
+        self.last_counts: Optional[torch.Tensor] = None
+        self.last_tokens: Optional[int] = None
 
-        # Determine sub heads using hidden ratio; keep head_dim constant
-        if config.H_moe_hidden_ratio is None:
-            # Roughly keep active params comparable: choose ~ 1/sqrt(top_k) ratio
-            head_ratio = 1.0 / max(math.sqrt(max(config.H_moe_top_k, 1)), 1.0)
-        else:
-            head_ratio = max(1e-3, float(config.H_moe_hidden_ratio))
-        num_heads_sub = max(1, int(round(parent_heads * head_ratio)))
-        # Ensure at least 1 and at most parent heads
-        num_heads_sub = min(num_heads_sub, parent_heads)
-
-        self.norm_eps = config.rms_norm_eps
-        self.router = TopKSequenceRouter(hidden_size=parent_hidden, num_experts=config.H_moe_num_experts, top_k=config.H_moe_top_k)
-        self.experts = nn.ModuleList([
-            ACTV1SlimExpertBlock(
-                parent_hidden_size=parent_hidden,
-                parent_num_heads=parent_heads,
-                parent_expansion=config.expansion,
-                norm_eps=config.rms_norm_eps,
-                num_heads_sub=num_heads_sub
-            ) for _ in range(config.H_moe_num_experts)
-        ])
-        # Expose last usage for logging
-        self.last_usage_load: Optional[torch.Tensor] = None  # [E]
-        self.last_counts: Optional[torch.Tensor] = None  # [E]
-        self.last_batch_size: Optional[int] = None
-        self.last_top_k: int = int(config.H_moe_top_k)
-
-    def forward(self, hidden_states: torch.Tensor, cos_sin: CosSin, input_injection: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Input injection (add) first to match ReasoningModule
-        hidden_states = hidden_states + input_injection
-
-        # Router weights per sequence (sparse top-k)
-        topk_idx, topk_weights, aux_loss = self.router(hidden_states)  # [B, K], [B, K]
-
-        B, S, H = hidden_states.shape
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x: [B, S, H]
+        B, S, H = x.shape
+        topk_idx, topk_weights, aux_loss = self.router(x)  # [B, S, K], [B, S, K]
         E = len(self.experts)
-        mixed = torch.zeros_like(hidden_states)
+        K = topk_idx.shape[-1]
 
-        # Build dense per-expert weights matrix W_full: [B, E]
-        W_full = hidden_states.new_zeros((B, E), dtype=topk_weights.dtype)
-        W_full.scatter_add_(dim=1, index=topk_idx, src=topk_weights)
+        # Dense per-expert weights W_full: [B, S, E]
+        W_full = x.new_zeros((B, S, E), dtype=topk_weights.dtype)
+        W_full.scatter_add_(dim=-1, index=topk_idx, src=topk_weights)
 
-        # For each expert, compute only for sequences that selected it
+        mixed = torch.zeros_like(x)
+        x_flat = x.reshape(B * S, H)
+        mixed_flat = mixed.view(B * S, H)
+        W_flat = W_full.view(B * S, E)
+
         for e, expert in enumerate(self.experts):
-            b_mask = W_full[:, e] > 0
-            if b_mask.any():
-                b_idx = torch.nonzero(b_mask, as_tuple=False).squeeze(-1)
-                hs_e = hidden_states.index_select(dim=0, index=b_idx)
-                out_e = expert(hidden_states=hs_e, cos_sin=cos_sin)  # [be, S, H]
-                # Cast weights to match out_e dtype to avoid dtype mismatch in index_add_
-                w_e = W_full.index_select(dim=0, index=b_idx)[:, e].unsqueeze(-1).unsqueeze(-1).to(out_e.dtype)
-                mixed.index_add_(dim=0, index=b_idx, source=out_e * w_e)
+            w_e = W_flat[:, e]
+            sel = w_e > 0
+            if sel.any():
+                idx = torch.nonzero(sel, as_tuple=False).squeeze(-1)
+                x_e = x_flat.index_select(dim=0, index=idx)
+                y_e = expert(x_e)  # [N_e, H]
+                w = w_e.index_select(0, idx).unsqueeze(-1).to(y_e.dtype)
+                mixed_flat.index_add_(0, idx, y_e * w)
 
-        # Residual + norm at parent space
-        out = rms_norm(hidden_states + mixed, variance_epsilon=self.norm_eps)
+        out = mixed  # [B, S, H]
 
-        # Store usage observability from router
-        self.last_usage_load = None if self.router.last_load is None else self.router.last_load.detach()
-        self.last_counts = None if self.router.last_counts is None else self.router.last_counts.detach()
-        self.last_batch_size = self.router.last_batch_size
+        # Log last usage
+        self.last_load = self.router.last_load
+        self.last_counts = self.router.last_counts
+        self.last_tokens = self.router.last_tokens
 
         return out, aux_loss
 
 
-class HierarchicalReasoningModel_ACTV1MoEReasoningModule(nn.Module):
-    """Drop-in replacement for H-level reasoning with MoE routing across sublayers."""
+class HierarchicalReasoningModel_ACTV1MoEBlock(nn.Module):
     def __init__(self, config: HierarchicalReasoningModel_ACTV1Config):
         super().__init__()
-        self.layers = nn.ModuleList([ACTV1MoERoutingLayer(config) for _ in range(config.H_layers)])
+        H = config.hidden_size
+        self.self_attn = Attention(
+            hidden_size=H,
+            head_dim=H // config.num_heads,
+            num_heads=config.num_heads,
+            num_key_value_heads=config.num_heads,
+            causal=False
+        )
+        # Expert FFN size control: effective_expert_expansion = base_expansion * H_moe_hidden_ratio (multiplier)
+        # Rule-of-thumb: per-token active FFN compute ~ top_k * H_moe_hidden_ratio of the dense baseline.
+        expert_mult = 1.0 if (config.H_moe_hidden_ratio is None) else float(config.H_moe_hidden_ratio)
+        effective_expansion = config.expansion * expert_mult
+        self.moe_mlp = MoEMLP(hidden_size=H, expansion=effective_expansion, num_experts=config.H_moe_num_experts, top_k=config.H_moe_top_k, norm_eps=config.rms_norm_eps)
+        self.norm_eps = config.rms_norm_eps
+        # Expose aux and usage
+        self.last_aux_loss: Optional[torch.Tensor] = None
+        self.last_load: Optional[torch.Tensor] = None
+        self.last_counts: Optional[torch.Tensor] = None
+        self.last_tokens: Optional[int] = None
+        self.expert_expansion_multiplier: float = expert_mult
+
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Attention + residual + norm
+        hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+        # MoE MLP + residual + norm
+        mlp_out, aux = self.moe_mlp(hidden_states)
+        self.last_aux_loss = aux
+        self.last_load = self.moe_mlp.last_load
+        self.last_counts = self.moe_mlp.last_counts
+        self.last_tokens = self.moe_mlp.last_tokens
+        hidden_states = rms_norm(hidden_states + mlp_out, variance_epsilon=self.norm_eps)
+        return hidden_states
+
+
+class HierarchicalReasoningModel_ACTV1MoEReasoningModule(nn.Module):
+    """Drop-in replacement for H-level reasoning using MoE blocks in layers 2..N.
+    Input injection is applied once at the module entrance to match baseline semantics.
+    """
+    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config):
+        super().__init__()
+        self.config = config
+        self.layers: nn.ModuleList = nn.ModuleList()
+        if config.H_layers > 0:
+            # Layer 1: standard block
+            self.layers.append(HierarchicalReasoningModel_ACTV1Block(config))
+        # Layers 2..N: MoE blocks
+        for _ in range(max(config.H_layers - 1, 0)):
+            self.layers.append(HierarchicalReasoningModel_ACTV1MoEBlock(config))
         self.last_aux_loss: Optional[torch.Tensor] = None
         self.last_usage_per_layer: Optional[List[torch.Tensor]] = None
 
     def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
         cos_sin = kwargs.get("cos_sin", None)
+        hidden_states = hidden_states + input_injection
+
         total_aux = None
         usage_list: List[torch.Tensor] = []
         for layer in self.layers:
-            hidden_states, aux = layer(hidden_states=hidden_states, cos_sin=cos_sin, input_injection=input_injection)
-            total_aux = aux if total_aux is None else (total_aux + aux)
-            if layer.last_usage_load is not None:
-                usage_list.append(layer.last_usage_load)
+            hidden_states = layer(cos_sin=cos_sin, hidden_states=hidden_states)
+            if isinstance(layer, HierarchicalReasoningModel_ACTV1MoEBlock):
+                aux = layer.last_aux_loss
+                if aux is not None:
+                    total_aux = aux if total_aux is None else (total_aux + aux)
+                if layer.last_load is not None:
+                    usage_list.append(layer.last_load)
+                else:
+                    usage_list.append(torch.zeros((layer.moe_mlp.router.num_experts,), device=hidden_states.device, dtype=torch.float32))
             else:
-                usage_list.append(torch.zeros((len(layer.experts),), device=hidden_states.device, dtype=torch.float32))
-        # Store for retrieval by caller (normalize by number of layers for stability)
-        if total_aux is not None and len(self.layers) > 0:
-            total_aux = total_aux / len(self.layers)
+                if self.config.H_moe_num_experts > 0:
+                    usage_list.append(torch.zeros((self.config.H_moe_num_experts,), device=hidden_states.device, dtype=torch.float32))
+
+        # Average aux over MoE layers for stability
+        num_moe_layers = sum(1 for l in self.layers if isinstance(l, HierarchicalReasoningModel_ACTV1MoEBlock))
+        if total_aux is not None and num_moe_layers > 0:
+            total_aux = total_aux / num_moe_layers
         self.last_aux_loss = total_aux
-        self.last_usage_per_layer = usage_list
+        self.last_usage_per_layer = usage_list if len(usage_list) > 0 else None
         return hidden_states
 
 
@@ -479,7 +465,6 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
         if getattr(self.inner, "H_level", None) is not None and hasattr(self.inner.H_level, "last_aux_loss"):
             aux = self.inner.H_level.last_aux_loss
             if aux is not None:
-                outputs["moe_aux_loss"] = aux  # keep grad so loss head can optimize router
+                outputs["moe_aux_loss"] = aux
 
         return HierarchicalReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
-

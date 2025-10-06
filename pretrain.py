@@ -4,6 +4,7 @@ import os
 import math
 import yaml
 import shutil
+import numpy as np
 
 import torch
 import torch.distributed as dist
@@ -16,6 +17,8 @@ import coolname
 import hydra
 import pydantic
 from omegaconf import DictConfig
+
+from utils.moe_logging import MoEUsageLogger, build_moe_usage_logger, collect_moe_counts_per_layer
 
 
 try:
@@ -187,14 +190,12 @@ def _safe_num_params(module: nn.Module) -> int:
 def compute_active_param_count(model_with_loss_head: nn.Module) -> int:
     """Compute active parameters for current architecture.
 
-    If H-level MoE is present, counts only top-k experts per H-layer as active
-    (plus the always-on router). Otherwise equals total parameter count.
-    This function is robust to architecture differences and avoids extra imports.
+    If H-level MoE is present, counts only top-k experts per MoE H-layer as active
+    (plus the always-on router and dense parts). Otherwise equals total parameter count.
     """
     total = _safe_num_params(model_with_loss_head)
     active = total
 
-    # Try to get to the inner HRM model and its H-level module
     try:
         base_model = getattr(model_with_loss_head, "model", None)  # ACT loss head wrapper
         inner = getattr(base_model, "inner", None)
@@ -202,20 +203,24 @@ def compute_active_param_count(model_with_loss_head: nn.Module) -> int:
         cfg = getattr(base_model, "config", None)
         top_k = int(getattr(cfg, "H_moe_top_k", 0)) if cfg is not None else 0
 
-        # Detect MoE reasoning module by duck-typing
         layers = getattr(H_level, "layers", None)
         if layers is None:
             return active
 
         for layer in layers:
+            # Support both legacy and SOTA MoE layouts
             experts = getattr(layer, "experts", None)
             if experts is None:
-                # Not an MoE layer
-                continue
+                moe_mlp = getattr(layer, "moe_mlp", None)
+                if moe_mlp is not None:
+                    experts = getattr(moe_mlp, "experts", None)
+            if experts is None:
+                continue  # Not an MoE layer
+
             num_experts = len(experts)
             if num_experts == 0:
                 continue
-            # Total parameters in all experts in this layer
+
             experts_total = _safe_num_params(experts)
             per_expert = _safe_num_params(experts[0])
             k = max(0, min(top_k, num_experts))
@@ -350,7 +355,11 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
             
             # Postprocess
-            count = max(reduced_metrics["count"], 1)  # Avoid NaNs
+            try:
+                count_val = float(np.asarray(reduced_metrics["count"]).item())
+            except Exception:
+                count_val = float(reduced_metrics["count"]) if reduced_metrics["count"] is not None else 0.0
+            count = max(count_val, 1.0)  # Avoid NaNs
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
 
             reduced_metrics["train/lr"] = lr_this_step
@@ -360,13 +369,13 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch.utils.data.DataLoader, eval_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
     with torch.inference_mode():
         set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
-        
+
         all_preds = {}
 
         metric_keys = []
         metric_values = None
         metric_global_batch_size = [0 for _ in range(len(set_ids))]
-        
+
         carry = None
         for set_name, batch, global_batch_size in eval_loader:
             # To device
@@ -377,7 +386,7 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
             # Forward
             while True:
                 carry, _, metrics, preds, all_finish = train_state.model(carry=carry, batch=batch, return_keys=config.eval_save_outputs)
-                
+
                 if all_finish:
                     break
 
@@ -386,16 +395,16 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
                     if k in config.eval_save_outputs:
                         all_preds.setdefault(k, [])
                         all_preds[k].append(v.cpu())  # Move to CPU for saving GPU memory
-                        
+
             del carry, preds, batch, all_finish
 
             # Aggregate
             set_id = set_ids[set_name]
-            
+
             if metric_values is None:
                 metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
                 metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda")
-                
+
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
             metric_global_batch_size[set_id] += global_batch_size
 
@@ -441,7 +450,13 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
 
             # Postprocess
             for set_name, metrics in reduced_metrics.items():
-                count = metrics.pop("count")
+                count_raw = metrics.pop("count")
+                try:
+                    count = float(np.asarray(count_raw).item())
+                except Exception:
+                    count = float(count_raw) if count_raw is not None else 0.0
+                if count <= 0:
+                    count = 1.0
                 reduced_metrics[set_name] = {k: v / count for k, v in metrics.items()}
 
             return reduced_metrics
@@ -471,7 +486,14 @@ def save_code_and_config(config: PretrainConfig):
 
     # Log code — guard to avoid aborting training when storage is full on cluster
     try:
-        wandb.run.log_code(config.checkpoint_path)
+        # Prefer run.log_code (older API), else fallback to top-level if available
+        if hasattr(wandb, "run") and wandb.run is not None and hasattr(wandb.run, "log_code"):
+            wandb.run.log_code(config.checkpoint_path)
+        elif hasattr(wandb, "log_code"):
+            wandb.log_code(config.checkpoint_path)  # type: ignore[attr-defined]
+        else:
+            # W&B version does not support code logging API
+            print("[W&B] Code logging API not available in this wandb version; skipping code upload.")
     except Exception as e:
         # Non-fatal: continue training if code logging fails (e.g., disk quota exceeded)
         print(f"[W&B] Skipping code logging due to error: {e}")
@@ -564,6 +586,9 @@ def launch(hydra_config: DictConfig):
     # Train state
     train_state = init_train_state(config, train_metadata, world_size=WORLD_SIZE)
 
+    # Initialize MoE usage logger if model has MoE layers
+    moe_logger = build_moe_usage_logger(train_state, log_every=max(50, (config.eval_interval or 1000) // 100))
+
     # Progress bar and logger
     progress_bar = None
     if RANK == 0:
@@ -587,8 +612,11 @@ def launch(hydra_config: DictConfig):
         for set_name, batch, global_batch_size in train_loader:
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
-            # All ranks must participate in MoE usage aggregation collectives
-            _log_moe_usage_histograms(train_state, WORLD_SIZE, RANK)
+            # New low-bandwidth MoE logging: aggregate counts and emit scalars + single heatmap image
+            if moe_logger is not None:
+                counts = collect_moe_counts_per_layer(train_state)
+                if counts is not None:
+                    moe_logger.update(counts, step=train_state.step, sync_dist=(WORLD_SIZE > 1), rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
@@ -610,78 +638,6 @@ def launch(hydra_config: DictConfig):
         dist.destroy_process_group()
     wandb.finish()
 
-
-def _log_moe_usage_histograms(train_state: TrainState, world_size: int, rank: int):
-    """Aggregate per-expert usage across ranks and log per-layer histograms to Weights & Biases.
-
-    For each H-level MoE layer, we perform identical collectives on all ranks to avoid NCCL mismatches.
-    If a layer is MoE (has `experts`), but this rank doesn't have `last_counts` populated yet, we all-reduce
-    zeros of the appropriate shape so every rank issues the same collectives per layer.
-    """
-    try:
-        base_model = getattr(train_state.model, "model", None)
-        inner = getattr(base_model, "inner", None)
-        H_level = getattr(inner, "H_level", None)
-        layers = getattr(H_level, "layers", None)
-        cfg = getattr(base_model, "config", None)
-    except Exception:
-        return
-    if layers is None or cfg is None:
-        return
-
-    # Fallbacks for consistent shapes across ranks
-    local_B = int(getattr(cfg, "batch_size", 1))
-    top_k = int(getattr(cfg, "H_moe_top_k", 0))
-
-    logs = {}
-    for li, layer in enumerate(layers):
-        # Only consider MoE layers (routing layers have `experts`)
-        experts = getattr(layer, "experts", None)
-        if experts is None:
-            continue
-        E = len(experts)
-        if E == 0:
-            continue
-
-        # Gather last usage if available; otherwise create zeros so every rank participates
-        counts = getattr(layer, "last_counts", None)
-        # Choose a device suitable for collectives
-        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
-        if counts is not None:
-            counts_t = counts.to(device=device, dtype=torch.float32).clone()
-            B_eff = int(getattr(layer, "last_batch_size", local_B))
-            K_eff = int(getattr(layer, "last_top_k", top_k))
-        else:
-            counts_t = torch.zeros((E,), device=device, dtype=torch.float32)
-            B_eff = local_B
-            K_eff = top_k
-        denom_t = torch.tensor([float(max(B_eff, 0) * max(K_eff, 0))], device=device, dtype=torch.float32)
-
-        # All ranks must participate with identical collectives for this MoE layer
-        if world_size > 1 and dist.is_initialized():
-            dist.all_reduce(counts_t, op=dist.ReduceOp.SUM)
-            dist.all_reduce(denom_t, op=dist.ReduceOp.SUM)
-
-        # Only rank 0 performs W&B logging
-        if rank != 0:
-            continue
-
-        total_selects = float(denom_t.item())
-        if total_selects <= 0:
-            continue
-        rate = (counts_t / total_selects).detach().cpu().tolist()
-
-        # Log as plain scalars (avoids W&B artifact tables and quotas)
-        for i, v in enumerate(rate):
-            logs[f"moe/usage_layer_{li}/expert_{i}"] = float(v)
-
-    if rank == 0 and len(logs):
-        try:
-            wandb.log(logs, step=train_state.step)
-        except Exception as e:
-            # Non-fatal: skip MoE usage logging if W&B storage is constrained
-            print(f"[W&B] Skipping MoE usage logging due to error: {e}")
 
 if __name__ == "__main__":
     launch()
