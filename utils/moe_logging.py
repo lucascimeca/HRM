@@ -46,7 +46,8 @@ class MoEUsageLogger:
         self.prefix = name_prefix
         self.step = 0
         self.layer_labels = [f"H{idx+1}" for idx in range(self.L)]
-        self.expert_labels = [f"E{j}" for j in range(self.maxE)]
+        # Use 1-based expert labels for readability (E1..Emax)
+        self.expert_labels = [f"E{j+1}" for j in range(self.maxE)]
         self.ema_counts = [torch.zeros(e, dtype=torch.float32) for e in self.E]
         if self.make_hist:
             self.bin_edges = np.linspace(0.0, 1.0, self.hist_bins + 1, dtype=np.float32)
@@ -184,7 +185,8 @@ class MoEUsageLogger:
                 step_x = 5 if self.maxE <= 80 else 10
                 xs = list(range(0, self.maxE, step_x))
                 ax.set_xticks(xs)
-                ax.set_xticklabels([f"E{x}" for x in xs], fontsize=8)
+                # +1 in label to reflect 1-based expert labels when subsampling
+                ax.set_xticklabels([f"E{x+1}" for x in xs], fontsize=8)
             ax.set_yticks(range(self.L))
             ax.set_yticklabels(self.layer_labels, fontsize=8)
             # Faint separators where layers have fewer experts than maxE
@@ -192,16 +194,20 @@ class MoEUsageLogger:
                 if e < self.maxE:
                     ax.plot([e - 0.5, e - 0.5], [li - 0.5, li + 0.5], color="w", alpha=0.25, linewidth=0.6)
             cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label("share", rotation=270, labelpad=8)
-            ax.set_title("MoE expert usage (per layer)")
+            cbar.set_label("usage share (0..1)", rotation=270, labelpad=8)
+            ax.set_title("MoE expert usage (rows=H-level layers, cols=experts)")
             try:
                 wandb.log({f"{self.prefix}/usage_heatmap": wandb.Image(fig)}, step=step)
             finally:
                 plt.close(fig)
         else:
-            # Fallback: compact unlabeled image
+            # Fallback: compact image with explicit caption describing axes
             img_u8 = (H * 255.0 + 0.5).astype(np.uint8)
-            wandb.log({f"{self.prefix}/usage_heatmap": wandb.Image(img_u8, caption=f"MoE usage (rows=layers, cols=experts) @ {step}")}, step=step)
+            caption = (
+                f"MoE usage heatmap @ step {step}. Rows=layers (H1..H{self.L}), "
+                f"Cols=experts (E1..E{self.maxE}). Values are normalized shares per layer (sum to 1)."
+            )
+            wandb.log({f"{self.prefix}/usage_heatmap": wandb.Image(img_u8, caption=caption)}, step=step)
 
     def update(
         self,

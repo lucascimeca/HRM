@@ -31,9 +31,34 @@ conda activate pytorch
 
 git pull
 
-# Get a unique port for this job based on the job ID
-export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
+# Rendezvous settings: pick a unique, free port and pass it explicitly to torchrun
 export MASTER_ADDR="127.0.0.1"
+# Base on SLURM job id but probe forward to avoid collisions
+BASE_PORT=$((10000 + ${SLURM_JOBID:-0} % 50000))
+CANDIDATE_PORT=${BASE_PORT}
+# probe up to 50 ports ahead
+for _ in $(seq 1 50); do
+  python - <<'PY'
+import os, socket, sys
+port = int(os.environ.get('CANDIDATE_PORT', '29500'))
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", port))
+    s.close()
+    sys.exit(0)
+except OSError:
+    sys.exit(1)
+PY
+  if [[ "$?" -eq 0 ]]; then
+    export MASTER_PORT=${CANDIDATE_PORT}
+    break
+  fi
+  CANDIDATE_PORT=$((CANDIDATE_PORT + 1))
+done
+# Fallback if loop failed
+export MASTER_PORT=${MASTER_PORT:-29500}
+echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
 
 # Fixes issues with MIG-ed GPUs with versions of PyTorch < 2.0
 unset CUDA_VISIBLE_DEVICES
@@ -75,7 +100,10 @@ fi
 export LD_LIBRARY_PATH="$PWD/libcuda_shim:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 
 
-torchrun --nproc_per_node=${GPUS_PER_NODE} ../pretrain.py \
+torchrun --nproc_per_node=${GPUS_PER_NODE} \
+    --master_addr "${MASTER_ADDR}" \
+    --master_port "${MASTER_PORT}" \
+    ../pretrain.py \
     data_path=$SCRATCH/projects/HRM/data/sudoku-extreme-1k-aug-1000 \
     epochs=20000 \
     eval_interval=2000 \
